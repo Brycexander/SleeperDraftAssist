@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor
 import math
+import os
 from typing import Iterable
 
 import numpy as np
@@ -74,6 +76,140 @@ class _SeasonResult:
     points: float
 
 
+def _resolve_workers(workers: int | str | None) -> int:
+    if workers in (None, 1, "1"):
+        return 1
+    if workers == "auto":
+        return max(1, (os.cpu_count() or 2) - 1)
+    return max(1, int(workers))
+
+
+def _simulation_chunks(simulations: int, workers: int) -> list[int]:
+    workers = min(workers, simulations)
+    base, extra = divmod(simulations, workers)
+    return [base + int(index < extra) for index in range(workers)]
+
+
+def _recommend_before_turn_worker(
+    context: LeagueContext,
+    players: list[Player],
+    manager_biases: dict[str, dict[str, float]],
+    seed: int,
+    simulations: int,
+) -> tuple[Counter[str], Counter[str], dict[str, float], Counter[str]]:
+    simulator = MonteCarloDraft(context, players, manager_biases, seed=seed)
+    selected = Counter[str]()
+    available = Counter[str]()
+    score_sum = defaultdict(float)
+    top_sum = Counter[str]()
+
+    for _ in range(simulations):
+        order, ranks = simulator._sample_opponent_board()
+        result = simulator._finish_rollout(simulator.base_state.clone(), order, ranks)
+        selected[result.first_selection] += 1
+        score_sum[result.first_selection] += result.user_score
+        top_sum[result.first_selection] += int(result.top_roster)
+        available.update(result.availability)
+
+    return selected, available, dict(score_sum), top_sum
+
+
+def _recommend_on_clock_worker(
+    context: LeagueContext,
+    players: list[Player],
+    manager_biases: dict[str, dict[str, float]],
+    seed: int,
+    candidate_id: str,
+    simulations: int,
+) -> tuple[str, float, int, int]:
+    simulator = MonteCarloDraft(context, players, manager_biases, seed=seed)
+    candidate = simulator.by_id[candidate_id]
+    score_sum = 0.0
+    top_count = 0
+
+    for _ in range(simulations):
+        order, ranks = simulator._sample_opponent_board()
+        result = simulator._finish_rollout(
+            simulator.base_state.clone(), order, ranks, forced_first_pick=candidate
+        )
+        score_sum += result.user_score
+        top_count += int(result.top_roster)
+
+    return candidate_id, score_sum, top_count, simulations
+
+
+def _analyze_worker(
+    context: LeagueContext,
+    players: list[Player],
+    manager_biases: dict[str, dict[str, float]],
+    seed: int,
+    simulations: int,
+    weekly_variance: float,
+) -> tuple[
+    Counter[str],
+    dict[str, float],
+    Counter[tuple[str, ...]],
+    Counter[tuple[tuple[str, int], ...]],
+    Counter[int],
+    int,
+    int,
+    float,
+    float,
+    list[tuple[_SeasonResult, RolloutResult]],
+]:
+    simulator = MonteCarloDraft(context, players, manager_biases, seed=seed)
+    settings = context.league.get("settings") or {}
+    playoff_teams = min(
+        context.rules.teams,
+        int(settings.get("playoff_teams", min(6, context.rules.teams))),
+    )
+    player_counts = Counter[str]()
+    player_rounds = defaultdict(float)
+    opening_counts = Counter[tuple[str, ...]]()
+    build_counts = Counter[tuple[tuple[str, int], ...]]()
+    finish_counts = Counter[int]()
+    playoff_count = 0
+    top_two_count = 0
+    wins_total = 0.0
+    finishes_total = 0.0
+    run_data: list[tuple[_SeasonResult, RolloutResult]] = []
+
+    for _ in range(simulations):
+        order, ranks = simulator._sample_opponent_board()
+        rollout = simulator._finish_rollout(simulator.base_state.clone(), order, ranks)
+        season = simulator._simulate_regular_season(rollout.roster_scores, weekly_variance)
+        run_data.append((season, rollout))
+        finish_counts[season.finish] += 1
+        playoff_count += int(season.finish <= playoff_teams)
+        top_two_count += int(season.finish <= min(2, playoff_teams))
+        wins_total += season.wins
+        finishes_total += season.finish
+
+        for round_number, player_id in rollout.user_picks:
+            player_counts[player_id] += 1
+            player_rounds[player_id] += round_number
+        opening = tuple(
+            simulator.by_id[player_id].position
+            for _, player_id in rollout.user_picks[: min(4, len(rollout.user_picks))]
+        )
+        opening_counts[opening] += 1
+        build = tuple(sorted(simulator._position_counts([p for _, p in rollout.user_picks]).items()))
+        build_counts[build] += 1
+
+    return (
+        player_counts,
+        dict(player_rounds),
+        opening_counts,
+        build_counts,
+        finish_counts,
+        playoff_count,
+        top_two_count,
+        wins_total,
+        finishes_total,
+        run_data,
+    )
+
+
 def snake_slot_for_pick(pick_number: int, teams: int) -> int:
     round_index, index_in_round = divmod(pick_number - 1, teams)
     if round_index % 2 == 0:
@@ -119,6 +255,7 @@ class MonteCarloDraft:
         self.players = list(players)
         self.by_id = {player.sleeper_id: player for player in self.players}
         self.manager_biases = manager_biases or {}
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
         self._add_missing_picked_players()
         self.has_projections = any(player.projected_points > 0 for player in self.players)
@@ -508,6 +645,7 @@ class MonteCarloDraft:
         simulations: int = 1000,
         weekly_variance: float = 0.22,
         top_players: int = 15,
+        workers: int | str = 1,
     ) -> DraftAnalysisReport:
         if simulations < 1:
             raise ValueError("simulations must be at least 1")
@@ -533,27 +671,57 @@ class MonteCarloDraft:
         finishes_total = 0.0
         run_data: list[tuple[_SeasonResult, RolloutResult]] = []
 
-        for _ in range(simulations):
-            order, ranks = self._sample_opponent_board()
-            rollout = self._finish_rollout(self.base_state.clone(), order, ranks)
-            season = self._simulate_regular_season(rollout.roster_scores, weekly_variance)
-            run_data.append((season, rollout))
-            finish_counts[season.finish] += 1
-            playoff_count += int(season.finish <= playoff_teams)
-            top_two_count += int(season.finish <= min(2, playoff_teams))
-            wins_total += season.wins
-            finishes_total += season.finish
+        worker_count = _resolve_workers(workers)
+        if worker_count == 1:
+            worker_results = [
+                _analyze_worker(
+                    self.context,
+                    self.players,
+                    self.manager_biases,
+                    int(self.rng.integers(0, 2**31 - 1)),
+                    simulations,
+                    weekly_variance,
+                )
+            ]
+        else:
+            chunks = _simulation_chunks(simulations, worker_count)
+            seeds = [self.seed + 100_000 + index for index in range(len(chunks))]
+            with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+                worker_results = list(
+                    executor.map(
+                        _analyze_worker,
+                        [self.context] * len(chunks),
+                        [self.players] * len(chunks),
+                        [self.manager_biases] * len(chunks),
+                        seeds,
+                        chunks,
+                        [weekly_variance] * len(chunks),
+                    )
+                )
 
-            for round_number, player_id in rollout.user_picks:
-                player_counts[player_id] += 1
-                player_rounds[player_id] += round_number
-            opening = tuple(
-                self.by_id[player_id].position
-                for _, player_id in rollout.user_picks[: min(4, len(rollout.user_picks))]
-            )
-            opening_counts[opening] += 1
-            build = tuple(sorted(self._position_counts([p for _, p in rollout.user_picks]).items()))
-            build_counts[build] += 1
+        for (
+            chunk_player_counts,
+            chunk_player_rounds,
+            chunk_opening_counts,
+            chunk_build_counts,
+            chunk_finish_counts,
+            chunk_playoff_count,
+            chunk_top_two_count,
+            chunk_wins_total,
+            chunk_finishes_total,
+            chunk_run_data,
+        ) in worker_results:
+            player_counts.update(chunk_player_counts)
+            for player_id, total_round in chunk_player_rounds.items():
+                player_rounds[player_id] += total_round
+            opening_counts.update(chunk_opening_counts)
+            build_counts.update(chunk_build_counts)
+            finish_counts.update(chunk_finish_counts)
+            playoff_count += chunk_playoff_count
+            top_two_count += chunk_top_two_count
+            wins_total += chunk_wins_total
+            finishes_total += chunk_finishes_total
+            run_data.extend(chunk_run_data)
 
         offensive_player_counts = [
             (player_id, count)
@@ -617,7 +785,12 @@ class MonteCarloDraft:
             representative_run=representative,
         )
 
-    def recommend(self, simulations: int = 3000, candidate_count: int = 10) -> SimulationReport:
+    def recommend(
+        self,
+        simulations: int = 3000,
+        candidate_count: int = 10,
+        workers: int | str = 1,
+    ) -> SimulationReport:
         if simulations < 1:
             raise ValueError("simulations must be at least 1")
         next_user_pick = next_pick_for_roster(
@@ -625,24 +798,51 @@ class MonteCarloDraft:
         )
         on_clock = next_user_pick == self.base_state.next_pick
         if on_clock:
-            return self._recommend_on_clock(simulations, candidate_count, next_user_pick)
-        return self._recommend_before_turn(simulations, next_user_pick)
+            return self._recommend_on_clock(
+                simulations, candidate_count, next_user_pick, workers
+            )
+        return self._recommend_before_turn(simulations, next_user_pick, workers)
 
-    def _recommend_before_turn(self, simulations: int, next_user_pick: int) -> SimulationReport:
+    def _recommend_before_turn(
+        self, simulations: int, next_user_pick: int, workers: int | str
+    ) -> SimulationReport:
         selected = Counter[str]()
         available = Counter[str]()
         score_sum = defaultdict(float)
         top_sum = Counter[str]()
 
-        for _ in range(simulations):
-            order, ranks = self._sample_opponent_board()
-            result = self._finish_rollout(
-                self.base_state.clone(), order, ranks
-            )
-            selected[result.first_selection] += 1
-            score_sum[result.first_selection] += result.user_score
-            top_sum[result.first_selection] += int(result.top_roster)
-            available.update(result.availability)
+        worker_count = _resolve_workers(workers)
+        if worker_count == 1:
+            worker_results = [
+                _recommend_before_turn_worker(
+                    self.context,
+                    self.players,
+                    self.manager_biases,
+                    int(self.rng.integers(0, 2**31 - 1)),
+                    simulations,
+                )
+            ]
+        else:
+            chunks = _simulation_chunks(simulations, worker_count)
+            seeds = [self.seed + 10_000 + index for index in range(len(chunks))]
+            with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+                worker_results = list(
+                    executor.map(
+                        _recommend_before_turn_worker,
+                        [self.context] * len(chunks),
+                        [self.players] * len(chunks),
+                        [self.manager_biases] * len(chunks),
+                        seeds,
+                        chunks,
+                    )
+                )
+
+        for chunk_selected, chunk_available, chunk_score_sum, chunk_top_sum in worker_results:
+            selected.update(chunk_selected)
+            available.update(chunk_available)
+            top_sum.update(chunk_top_sum)
+            for player_id, score in chunk_score_sum.items():
+                score_sum[player_id] += score
 
         recommendations = []
         for player_id, samples in selected.most_common(12):
@@ -665,7 +865,11 @@ class MonteCarloDraft:
         )
 
     def _recommend_on_clock(
-        self, simulations: int, candidate_count: int, next_user_pick: int
+        self,
+        simulations: int,
+        candidate_count: int,
+        next_user_pick: int,
+        workers: int | str,
     ) -> SimulationReport:
         candidates = self._ordered_candidates(
             self.base_state,
@@ -678,24 +882,64 @@ class MonteCarloDraft:
         per_candidate = max(25, simulations // max(1, len(candidates)))
         recommendations = []
 
-        for candidate in candidates:
-            score_sum = 0.0
-            top_count = 0
-            for _ in range(per_candidate):
-                order, ranks = self._sample_opponent_board()
-                result = self._finish_rollout(
-                    self.base_state.clone(), order, ranks, forced_first_pick=candidate
+        worker_count = _resolve_workers(workers)
+        if worker_count == 1:
+            worker_results = []
+            for candidate in candidates:
+                worker_results.append(
+                    _recommend_on_clock_worker(
+                        self.context,
+                        self.players,
+                        self.manager_biases,
+                        int(self.rng.integers(0, 2**31 - 1)),
+                        candidate.sleeper_id,
+                        per_candidate,
+                    )
                 )
-                score_sum += result.user_score
-                top_count += int(result.top_roster)
+        else:
+            tasks = []
+            for candidate_index, candidate in enumerate(candidates):
+                chunks = _simulation_chunks(per_candidate, worker_count)
+                for chunk_index, chunk in enumerate(chunks):
+                    tasks.append(
+                        (
+                            self.seed + 20_000 + candidate_index * 1_000 + chunk_index,
+                            candidate.sleeper_id,
+                            chunk,
+                        )
+                    )
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                worker_results = list(
+                    executor.map(
+                        _recommend_on_clock_worker,
+                        [self.context] * len(tasks),
+                        [self.players] * len(tasks),
+                        [self.manager_biases] * len(tasks),
+                        [seed for seed, _, _ in tasks],
+                        [candidate_id for _, candidate_id, _ in tasks],
+                        [chunk for _, _, chunk in tasks],
+                    )
+                )
+
+        by_candidate: dict[str, list[float | int]] = {
+            candidate.sleeper_id: [0.0, 0, 0] for candidate in candidates
+        }
+        for candidate_id, score_sum, top_count, samples in worker_results:
+            totals = by_candidate[candidate_id]
+            totals[0] = float(totals[0]) + score_sum
+            totals[1] = int(totals[1]) + top_count
+            totals[2] = int(totals[2]) + samples
+
+        for candidate in candidates:
+            score_sum, top_count, samples = by_candidate[candidate.sleeper_id]
             recommendations.append(
                 Recommendation(
                     player=candidate,
                     availability_rate=1.0,
                     selection_rate=1.0,
-                    mean_score=score_sum / per_candidate,
-                    top_roster_rate=top_count / per_candidate,
-                    samples=per_candidate,
+                    mean_score=float(score_sum) / int(samples),
+                    top_roster_rate=int(top_count) / int(samples),
+                    samples=int(samples),
                 )
             )
 

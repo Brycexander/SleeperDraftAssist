@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import os
 from pathlib import Path
 import sys
 import time
@@ -72,12 +73,33 @@ def _add_simulation_arguments(
         )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
+        "--workers",
+        default=1,
+        type=_parse_workers,
+        help="Parallel worker processes for simulations, or 'auto' (default: 1)",
+    )
+    parser.add_argument(
         "--history-seasons",
         type=int,
         default=3,
         help="Previous league seasons used for manager tendencies",
     )
     parser.add_argument("--refresh-rankings", action="store_true")
+
+
+def _parse_workers(value: str) -> int | str:
+    if value == "auto":
+        return value
+    workers = int(value)
+    if workers < 1:
+        raise argparse.ArgumentTypeError("--workers must be >= 1 or 'auto'")
+    return workers
+
+
+def _worker_label(workers: int | str) -> str:
+    if workers == "auto":
+        return f"auto ({max(1, (os.cpu_count() or 2) - 1)})"
+    return str(workers)
 
 
 def _print_league(context: LeagueContext) -> None:
@@ -279,7 +301,7 @@ def _load_simulator(
 
 def _recommend(client: SleeperClient, context: LeagueContext, args: argparse.Namespace) -> None:
     simulator, _, _ = _load_simulator(client, context, args)
-    report = simulator.recommend(args.simulations, args.candidates)
+    report = simulator.recommend(args.simulations, args.candidates, args.workers)
     _print_report(context, report)
 
 
@@ -289,6 +311,7 @@ def _analyze(client: SleeperClient, context: LeagueContext, args: argparse.Names
         simulations=args.simulations,
         weekly_variance=args.weekly_variance,
         top_players=args.top_players,
+        workers=args.workers,
     )
     _print_analysis(context, report)
 
@@ -297,7 +320,10 @@ def _watch(client: SleeperClient, context: LeagueContext, args: argparse.Namespa
     _, board, biases = _load_simulator(client, context, args)
     draft_id = str(context.draft["draft_id"])
     last_signature: tuple[tuple[int, str], ...] | None = None
-    print(f"Watching draft every {args.interval:g}s. Press Ctrl-C to stop.")
+    print(
+        f"Watching draft every {args.interval:g}s with {_worker_label(args.workers)} "
+        "worker(s). Press Ctrl-C to stop."
+    )
 
     while True:
         picks = client.picks(draft_id)
@@ -308,7 +334,10 @@ def _watch(client: SleeperClient, context: LeagueContext, args: argparse.Namespa
             context.picks = picks
             simulator = MonteCarloDraft(context, board, biases, seed=args.seed + len(picks))
             print(f"\nBoard updated: {len(picks)} pick(s) complete")
-            _print_report(context, simulator.recommend(args.simulations, args.candidates))
+            _print_report(
+                context,
+                simulator.recommend(args.simulations, args.candidates, args.workers),
+            )
             last_signature = signature
         time.sleep(args.interval)
 

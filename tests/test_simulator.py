@@ -101,6 +101,16 @@ def test_recommendation_runs_from_an_empty_board() -> None:
     assert all(item.samples >= 25 for item in report.recommendations)
 
 
+def test_parallel_recommendation_accounts_for_rollouts() -> None:
+    simulator = MonteCarloDraft(make_context(), make_players(), seed=7)
+    report = simulator.recommend(simulations=80, candidate_count=2, workers=2)
+
+    assert report.on_clock
+    assert len(report.recommendations) == 2
+    assert report.total_rollouts == 80
+    assert sum(item.samples for item in report.recommendations) == 80
+
+
 def test_existing_picks_advance_the_board() -> None:
     context = make_context()
     context.picks = [
@@ -128,6 +138,20 @@ def test_analysis_summarizes_drafts_and_playoff_results() -> None:
     assert len(report.common_players) == 6
     assert len(report.representative_run.picks) == 4
     assert 0.0 <= report.average_wins <= report.regular_season_weeks
+
+
+def test_parallel_analysis_summarizes_requested_simulations() -> None:
+    simulator = MonteCarloDraft(make_context(), make_players(), seed=17)
+    report = simulator.analyze(
+        simulations=40,
+        weekly_variance=0.14,
+        top_players=6,
+        workers=2,
+    )
+
+    assert report.simulations == 40
+    assert sum(report.finish_rates) == 1.0
+    assert len(report.common_players) == 6
 
 
 def test_round_robin_pairs_every_team_once_per_round() -> None:
