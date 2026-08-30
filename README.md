@@ -4,7 +4,8 @@ Monte Carlo draft recommendations tailored to a Sleeper league's scoring,
 roster slots, draft order, completed picks, and prior manager tendencies.
 
 The defaults are configured for `brycexander` in The Unemployables
-(`1387590026778411008`). Player value combines Sleeper season projections,
+(`1387590026778411008`), with Hooligans (`1389738046894657536`) available as a
+saved league. Player value combines Sleeper season projections,
 Sleeper PPR ADP, and the current full-PPR Expert Consensus Ranking board loaded
 through `nflreadpy`.
 
@@ -36,6 +37,12 @@ Run a recommendation before or during the draft:
 uv run sleeper-draft recommend
 ```
 
+Run the same league-aware advice for Hooligans:
+
+```bash
+uv run sleeper-draft --league hooligans recommend
+```
+
 Summarize the most common simulated teams and estimate playoff probability:
 
 ```bash
@@ -65,7 +72,7 @@ Force a fresh ranking download or use more rollouts:
 uv run sleeper-draft recommend --simulations 5000 --refresh-rankings
 ```
 
-Global settings go before the command when targeting another league:
+Global settings go before the command when targeting an arbitrary league:
 
 ```bash
 uv run sleeper-draft --league-id LEAGUE_ID --username USERNAME recommend

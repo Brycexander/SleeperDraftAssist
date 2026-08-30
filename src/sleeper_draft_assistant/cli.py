@@ -14,8 +14,12 @@ from .sleeper import SleeperClient
 from .valuation import ValuationDiagnostics, build_player_values
 
 
-DEFAULT_LEAGUE_ID = "1387590026778411008"
 DEFAULT_USERNAME = "brycexander"
+DEFAULT_LEAGUE = "unemployables"
+LEAGUE_IDS = {
+    "unemployables": "1387590026778411008",
+    "hooligans": "1389738046894657536",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,7 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
         prog="sleeper-draft",
         description="League-aware Monte Carlo recommendations for a Sleeper draft.",
     )
-    parser.add_argument("--league-id", default=DEFAULT_LEAGUE_ID)
+    league = parser.add_mutually_exclusive_group()
+    league.add_argument(
+        "--league",
+        choices=tuple(LEAGUE_IDS),
+        default=DEFAULT_LEAGUE,
+        help=f"Saved league to use (default: {DEFAULT_LEAGUE})",
+    )
+    league.add_argument("--league-id", help="Sleeper league ID (overrides saved leagues)")
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -100,6 +111,10 @@ def _worker_label(workers: int | str) -> str:
     if workers == "auto":
         return f"auto ({max(1, (os.cpu_count() or 2) - 1)})"
     return str(workers)
+
+
+def _league_id(args: argparse.Namespace) -> str:
+    return args.league_id or LEAGUE_IDS[args.league]
 
 
 def _print_league(context: LeagueContext) -> None:
@@ -346,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     client = SleeperClient()
     try:
-        context = client.sync(args.league_id, args.username)
+        context = client.sync(_league_id(args), args.username)
         _print_league(context)
         if args.command == "league":
             return 0
