@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from concurrent.futures import ProcessPoolExecutor
 import math
 import os
 from typing import Iterable
@@ -673,16 +673,27 @@ class MonteCarloDraft:
 
         worker_count = _resolve_workers(workers)
         if worker_count == 1:
-            worker_results = [
-                _analyze_worker(
-                    self.context,
-                    self.players,
-                    self.manager_biases,
-                    int(self.rng.integers(0, 2**31 - 1)),
-                    simulations,
-                    weekly_variance,
+            for _ in range(simulations):
+                order, ranks = self._sample_opponent_board()
+                rollout = self._finish_rollout(self.base_state.clone(), order, ranks)
+                season = self._simulate_regular_season(rollout.roster_scores, weekly_variance)
+                run_data.append((season, rollout))
+                finish_counts[season.finish] += 1
+                playoff_count += int(season.finish <= playoff_teams)
+                top_two_count += int(season.finish <= min(2, playoff_teams))
+                wins_total += season.wins
+                finishes_total += season.finish
+
+                for round_number, player_id in rollout.user_picks:
+                    player_counts[player_id] += 1
+                    player_rounds[player_id] += round_number
+                opening = tuple(
+                    self.by_id[player_id].position
+                    for _, player_id in rollout.user_picks[: min(4, len(rollout.user_picks))]
                 )
-            ]
+                opening_counts[opening] += 1
+                build = tuple(sorted(self._position_counts([p for _, p in rollout.user_picks]).items()))
+                build_counts[build] += 1
         else:
             chunks = _simulation_chunks(simulations, worker_count)
             seeds = [self.seed + 100_000 + index for index in range(len(chunks))]
@@ -699,29 +710,29 @@ class MonteCarloDraft:
                     )
                 )
 
-        for (
-            chunk_player_counts,
-            chunk_player_rounds,
-            chunk_opening_counts,
-            chunk_build_counts,
-            chunk_finish_counts,
-            chunk_playoff_count,
-            chunk_top_two_count,
-            chunk_wins_total,
-            chunk_finishes_total,
-            chunk_run_data,
-        ) in worker_results:
-            player_counts.update(chunk_player_counts)
-            for player_id, total_round in chunk_player_rounds.items():
-                player_rounds[player_id] += total_round
-            opening_counts.update(chunk_opening_counts)
-            build_counts.update(chunk_build_counts)
-            finish_counts.update(chunk_finish_counts)
-            playoff_count += chunk_playoff_count
-            top_two_count += chunk_top_two_count
-            wins_total += chunk_wins_total
-            finishes_total += chunk_finishes_total
-            run_data.extend(chunk_run_data)
+            for (
+                chunk_player_counts,
+                chunk_player_rounds,
+                chunk_opening_counts,
+                chunk_build_counts,
+                chunk_finish_counts,
+                chunk_playoff_count,
+                chunk_top_two_count,
+                chunk_wins_total,
+                chunk_finishes_total,
+                chunk_run_data,
+            ) in worker_results:
+                player_counts.update(chunk_player_counts)
+                for player_id, total_round in chunk_player_rounds.items():
+                    player_rounds[player_id] += total_round
+                opening_counts.update(chunk_opening_counts)
+                build_counts.update(chunk_build_counts)
+                finish_counts.update(chunk_finish_counts)
+                playoff_count += chunk_playoff_count
+                top_two_count += chunk_top_two_count
+                wins_total += chunk_wins_total
+                finishes_total += chunk_finishes_total
+                run_data.extend(chunk_run_data)
 
         offensive_player_counts = [
             (player_id, count)
@@ -813,15 +824,15 @@ class MonteCarloDraft:
 
         worker_count = _resolve_workers(workers)
         if worker_count == 1:
-            worker_results = [
-                _recommend_before_turn_worker(
-                    self.context,
-                    self.players,
-                    self.manager_biases,
-                    int(self.rng.integers(0, 2**31 - 1)),
-                    simulations,
+            for _ in range(simulations):
+                order, ranks = self._sample_opponent_board()
+                result = self._finish_rollout(
+                    self.base_state.clone(), order, ranks
                 )
-            ]
+                selected[result.first_selection] += 1
+                score_sum[result.first_selection] += result.user_score
+                top_sum[result.first_selection] += int(result.top_roster)
+                available.update(result.availability)
         else:
             chunks = _simulation_chunks(simulations, worker_count)
             seeds = [self.seed + 10_000 + index for index in range(len(chunks))]
@@ -837,12 +848,12 @@ class MonteCarloDraft:
                     )
                 )
 
-        for chunk_selected, chunk_available, chunk_score_sum, chunk_top_sum in worker_results:
-            selected.update(chunk_selected)
-            available.update(chunk_available)
-            top_sum.update(chunk_top_sum)
-            for player_id, score in chunk_score_sum.items():
-                score_sum[player_id] += score
+            for chunk_selected, chunk_available, chunk_score_sum, chunk_top_sum in worker_results:
+                selected.update(chunk_selected)
+                available.update(chunk_available)
+                top_sum.update(chunk_top_sum)
+                for player_id, score in chunk_score_sum.items():
+                    score_sum[player_id] += score
 
         recommendations = []
         for player_id, samples in selected.most_common(12):
@@ -884,16 +895,24 @@ class MonteCarloDraft:
 
         worker_count = _resolve_workers(workers)
         if worker_count == 1:
-            worker_results = []
             for candidate in candidates:
-                worker_results.append(
-                    _recommend_on_clock_worker(
-                        self.context,
-                        self.players,
-                        self.manager_biases,
-                        int(self.rng.integers(0, 2**31 - 1)),
-                        candidate.sleeper_id,
-                        per_candidate,
+                score_sum = 0.0
+                top_count = 0
+                for _ in range(per_candidate):
+                    order, ranks = self._sample_opponent_board()
+                    result = self._finish_rollout(
+                        self.base_state.clone(), order, ranks, forced_first_pick=candidate
+                    )
+                    score_sum += result.user_score
+                    top_count += int(result.top_roster)
+                recommendations.append(
+                    Recommendation(
+                        player=candidate,
+                        availability_rate=1.0,
+                        selection_rate=1.0,
+                        mean_score=score_sum / per_candidate,
+                        top_roster_rate=top_count / per_candidate,
+                        samples=per_candidate,
                     )
                 )
         else:
@@ -921,27 +940,27 @@ class MonteCarloDraft:
                     )
                 )
 
-        by_candidate: dict[str, list[float | int]] = {
-            candidate.sleeper_id: [0.0, 0, 0] for candidate in candidates
-        }
-        for candidate_id, score_sum, top_count, samples in worker_results:
-            totals = by_candidate[candidate_id]
-            totals[0] = float(totals[0]) + score_sum
-            totals[1] = int(totals[1]) + top_count
-            totals[2] = int(totals[2]) + samples
+            by_candidate: dict[str, list[float | int]] = {
+                candidate.sleeper_id: [0.0, 0, 0] for candidate in candidates
+            }
+            for candidate_id, score_sum, top_count, samples in worker_results:
+                totals = by_candidate[candidate_id]
+                totals[0] = float(totals[0]) + score_sum
+                totals[1] = int(totals[1]) + top_count
+                totals[2] = int(totals[2]) + samples
 
-        for candidate in candidates:
-            score_sum, top_count, samples = by_candidate[candidate.sleeper_id]
-            recommendations.append(
-                Recommendation(
-                    player=candidate,
-                    availability_rate=1.0,
-                    selection_rate=1.0,
-                    mean_score=float(score_sum) / int(samples),
-                    top_roster_rate=int(top_count) / int(samples),
-                    samples=int(samples),
+            for candidate in candidates:
+                score_sum, top_count, samples = by_candidate[candidate.sleeper_id]
+                recommendations.append(
+                    Recommendation(
+                        player=candidate,
+                        availability_rate=1.0,
+                        selection_rate=1.0,
+                        mean_score=float(score_sum) / int(samples),
+                        top_roster_rate=int(top_count) / int(samples),
+                        samples=int(samples),
+                    )
                 )
-            )
 
         recommendations.sort(
             key=lambda item: (item.mean_score, item.top_roster_rate), reverse=True
