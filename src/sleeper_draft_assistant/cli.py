@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import json
 import os
-from pathlib import Path
 import sys
 import time
 
+from .cache import cache_directory
 from .models import LeagueContext, Player
+from .native_engine import create_recommendation_engine
 from .rankings import load_consensus_board
 from .simulator import DraftAnalysisReport, MonteCarloDraft, SimulationReport
 from .sleeper import SleeperClient
@@ -19,6 +21,7 @@ DEFAULT_LEAGUE = "unemployables"
 LEAGUE_IDS = {
     "unemployables": "1387590026778411008",
     "hooligans": "1389738046894657536",
+    "shield-ai": "1401668384990494720",
 }
 
 
@@ -69,25 +72,50 @@ def build_parser() -> argparse.ArgumentParser:
     watch = subparsers.add_parser("watch", help="Watch the draft and rerun after each pick")
     _add_simulation_arguments(watch)
     watch.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds")
+    for command, help_text in (
+        ("lineup", "Pick the strongest legal weekly starting lineup"),
+        ("waivers", "Find unrostered players that improve your team"),
+        ("trades", "Find balanced trades that improve both teams"),
+    ):
+        team = subparsers.add_parser(command, help=help_text)
+        team.add_argument("--week", type=int, choices=range(1, 19), help="NFL week (default: current)")
+        team.add_argument("--season", type=int, help="Verify the current season, required to confirm unlabeled tiers")
+        team.add_argument("--mode", choices=("projection", "tiers"), default="projection")
+        team.add_argument("--limit", type=_positive_int, default=10)
+        team.add_argument("--refresh", action="store_true", help="Refresh weekly source data")
+        team.add_argument("--confirm-tiers-week", action="store_true", help="Confirm you checked the tiers site matches --season and --week")
+        team.add_argument("--json", action="store_true", help="Print the full structured report")
     return parser
 
 
 def _add_simulation_arguments(
     parser: argparse.ArgumentParser, include_candidates: bool = True
 ) -> None:
-    parser.add_argument(
-        "--simulations", type=int, default=1000, help="Total Monte Carlo rollouts"
+    simulations = parser.add_mutually_exclusive_group()
+    simulations.add_argument(
+        "--simulations", type=_positive_int, help="Total Monte Carlo rollouts (default: 1000)"
     )
     if include_candidates:
         parser.add_argument(
-            "--candidates", type=int, default=10, help="Options tested on the clock"
+            "--candidates", type=_positive_int, default=10, help="Options tested on the clock"
+        )
+        simulations.add_argument(
+            "--runs-per-candidate",
+            type=_positive_int,
+            help="Rollouts per candidate; total rollouts are this value times --candidates",
+        )
+        parser.add_argument(
+            "--engine",
+            choices=("auto", "cpp", "python"),
+            default="auto",
+            help="Recommendation engine (default: auto)",
         )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
         "--workers",
         default=1,
         type=_parse_workers,
-        help="Parallel worker processes for simulations, or 'auto' (default: 1)",
+        help="Native threads or Python processes, or 'auto' (default: 1)",
     )
     parser.add_argument(
         "--history-seasons",
@@ -107,9 +135,25 @@ def _parse_workers(value: str) -> int | str:
     return workers
 
 
-def _worker_label(workers: int | str) -> str:
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return number
+
+
+def _simulation_total(args: argparse.Namespace) -> int:
+    runs_per_candidate = getattr(args, "runs_per_candidate", None)
+    if runs_per_candidate is not None:
+        return runs_per_candidate * args.candidates
+    return args.simulations if args.simulations is not None else 1000
+
+
+def _worker_label(workers: int | str, engine_name: str = "python") -> str:
     if workers == "auto":
-        return f"auto ({max(1, (os.cpu_count() or 2) - 1)})"
+        detected = os.cpu_count() or 2
+        count = detected if engine_name == "cpp" else max(1, detected - 1)
+        return f"auto ({count})"
     return str(workers)
 
 
@@ -149,21 +193,41 @@ def _print_report(context: LeagueContext, report: SimulationReport) -> None:
     print()
     print(f"Monte Carlo result ({report.total_rollouts:,} rollouts, {status})")
     if report.on_clock:
-        print("Rank  Player                    Pos Team  Top roster  Model score  Sims")
-        print("----  ------------------------  --- ----  ----------  -----------  ----")
+        print(
+            "Rank  Player                    Pos Team  Lineup +  Next turn  "
+            "Wait cost  Top roster  Model score  Sims"
+        )
+        print(
+            "----  ------------------------  --- ----  --------  ---------  "
+            "---------  ----------  -----------  ----"
+        )
         for rank, item in enumerate(report.recommendations, start=1):
+            next_turn = (
+                f"{item.next_pick_availability:.1%}"
+                if item.next_pick_availability is not None
+                else "n/a"
+            )
             print(
                 f"{rank:>4}  {item.player.name[:24]:<24}  {item.player.position:<3} "
-                f"{item.player.team[:4]:<4}  {item.top_roster_rate:>9.1%}  "
+                f"{item.player.team[:4]:<4}  {item.starter_gain:>8.1f}  "
+                f"{next_turn:>9}  {item.wait_cost:>9.1f}  "
+                f"{item.top_roster_rate:>9.1%}  "
                 f"{item.mean_score:>11.1f}  {item.samples:>4}"
             )
     else:
-        print("Player                    Pos Team  Available  AI selects  Top roster  Sims")
-        print("------------------------  --- ----  ---------  ----------  ----------  ----")
+        print(
+            "Player                    Pos Team  Available  AI selects  Lineup +  "
+            "Top roster  Sims"
+        )
+        print(
+            "------------------------  --- ----  ---------  ----------  --------  "
+            "----------  ----"
+        )
         for item in report.recommendations:
             print(
                 f"{item.player.name[:24]:<24}  {item.player.position:<3} {item.player.team[:4]:<4}  "
                 f"{item.availability_rate:>8.1%}  {item.selection_rate:>9.1%}  "
+                f"{item.starter_gain:>8.1f}  "
                 f"{item.top_roster_rate:>9.1%}  {item.samples:>4}"
             )
         print("AI selects is the adaptive recommendation after the picks ahead of you are simulated.")
@@ -171,6 +235,11 @@ def _print_report(context: LeagueContext, report: SimulationReport) -> None:
         "Top roster uses league-scored projections and uncertain player outcomes; "
         "it is not a literal championship probability."
     )
+    if report.on_clock:
+        print(
+            "Lineup + is the projected starter/bench gain. Next turn is the "
+            "conditional chance the player survives; wait cost is expected VORP lost."
+        )
 
 
 def _print_analysis(context: LeagueContext, report: DraftAnalysisReport) -> None:
@@ -253,6 +322,12 @@ def _print_valuation_diagnostics(diagnostics: ValuationDiagnostics) -> None:
         for position, points in diagnostics.replacement_points.items()
     )
     print(f"Projection coverage: {projection_sources}")
+    if diagnostics.history_seasons:
+        seasons = "-".join(str(season) for season in diagnostics.history_seasons)
+        print(
+            f"Historical calibration: {diagnostics.historical_players} players "
+            f"with usable {seasons} results"
+        )
     print(f"Draft-market coverage: {adp_sources}")
     print(f"Replacement baselines: {replacement} season points")
 
@@ -261,7 +336,7 @@ def _load_values(
     context: LeagueContext,
     args: argparse.Namespace,
 ) -> tuple[list[Player], ValuationDiagnostics]:
-    cache_dir = Path(__file__).resolve().parents[2] / ".cache"
+    cache_dir = cache_directory()
     print("Loading current full-PPR expert consensus rankings...")
     board = load_consensus_board(cache_dir, refresh=args.refresh_rankings)
     print("Scoring projections and replacement value for this league...")
@@ -281,20 +356,33 @@ def _print_values(players: list[Player], args: argparse.Namespace) -> None:
         players = [player for player in players if player.position == args.position]
     players = players[: max(1, args.top)]
     print()
-    print("Value  Player                    Pos Team   Proj   VORP   ECR    ADP  Inj  Role  Source")
-    print("-----  ------------------------  --- ----  -----  -----  -----  -----  ---  ----  -------------")
+    print(
+        "Rank  Player                    Pos Team  Score  ProjV  ECRV  Risk  "
+        "Online   Hist   H%  Blend   VORP    ADP"
+    )
+    print(
+        "----  ------------------------  --- ----  -----  -----  ----  ----  "
+        "------  -----  ---  -----  -----  -----"
+    )
     for player in players:
         adp = f"{player.adp:.1f}" if player.adp is not None else "-"
+        historical = (
+            f"{player.historical_points:.1f}"
+            if player.history_weight > 0
+            else "-"
+        )
         print(
             f"{player.value_rank:>5.0f}  {player.name[:24]:<24}  {player.position:<3} "
-            f"{player.team[:4]:<4}  {player.projected_points:>5.1f}  "
-            f"{player.vorp:>5.1f}  {player.ecr:>5.1f}  {adp:>5}  "
-            f"{player.injury_risk:>3.0%}  {player.role_risk:>4.0%}  "
-            f"{player.projection_source}"
+            f"{player.team[:4]:<4}  {player.value_score:>5.1f}  "
+            f"{player.projection_component:>5.1f}  {player.consensus_component:>4.1f}  "
+            f"{player.risk_penalty:>4.1f}  {player.online_projected_points:>6.1f}  "
+            f"{historical:>5}  {player.history_weight:>3.0%}  "
+            f"{player.projected_points:>5.1f}  {player.vorp:>5.1f}  {adp:>5}"
         )
     print(
-        "\nValue blends league-specific VORP (82%) with ECR (18%), then applies "
-        "current injury and role-risk penalties. ADP predicts availability, not quality."
+        "\nBlend combines current online projections with a reliability-weighted "
+        "historical baseline (maximum 10-25% by position). Score = ProjV + ECRV "
+        "- Risk. ADP remains an availability signal, not player quality."
     )
 
 
@@ -304,26 +392,53 @@ def _load_simulator(
     args: argparse.Namespace,
     board=None,
     biases=None,
-) -> tuple[MonteCarloDraft, list, dict]:
+) -> tuple[MonteCarloDraft | object, list, dict, str]:
     if board is None:
         board, _ = _load_values(context, args)
     if biases is None:
         print(f"Loading up to {args.history_seasons} prior season(s) of manager tendencies...")
-        biases = client.manager_position_biases(context.league, args.history_seasons)
-    simulator = MonteCarloDraft(context, board, biases, seed=args.seed)
-    return simulator, board, biases
+        biases = client.manager_position_biases(
+            context.league,
+            args.history_seasons,
+            additional_league_ids=LEAGUE_IDS.values(),
+        )
+    simulator, engine_name = create_recommendation_engine(
+        args.engine, context, board, biases, seed=args.seed
+    )
+    return simulator, board, biases, engine_name
 
 
 def _recommend(client: SleeperClient, context: LeagueContext, args: argparse.Namespace) -> None:
-    simulator, _, _ = _load_simulator(client, context, args)
-    report = simulator.recommend(args.simulations, args.candidates, args.workers)
+    started = time.perf_counter()
+    simulator, _, _, engine_name = _load_simulator(client, context, args)
+    prepared = time.perf_counter()
+    total = _simulation_total(args)
+    report = simulator.recommend(total, args.candidates, args.workers)
+    simulated = time.perf_counter()
     _print_report(context, report)
+    per_candidate = (
+        f" | requested per candidate {args.runs_per_candidate:,}"
+        if args.runs_per_candidate is not None
+        else ""
+    )
+    print(
+        f"Timing: engine {engine_name} | workers {_worker_label(args.workers, engine_name)}{per_candidate} | "
+        f"model preparation {prepared - started:.1f}s | "
+        f"simulations {simulated - prepared:.1f}s | total {simulated - started:.1f}s"
+    )
 
 
 def _analyze(client: SleeperClient, context: LeagueContext, args: argparse.Namespace) -> None:
-    simulator, _, _ = _load_simulator(client, context, args)
+    board, _ = _load_values(context, args)
+    print(f"Loading up to {args.history_seasons} prior season(s) of manager tendencies...")
+    biases = client.manager_position_biases(
+        context.league,
+        args.history_seasons,
+        additional_league_ids=LEAGUE_IDS.values(),
+    )
+    simulator = MonteCarloDraft(context, board, biases, seed=args.seed)
     report = simulator.analyze(
-        simulations=args.simulations,
+        simulations=_simulation_total(args),
         weekly_variance=args.weekly_variance,
         top_players=args.top_players,
         workers=args.workers,
@@ -332,12 +447,14 @@ def _analyze(client: SleeperClient, context: LeagueContext, args: argparse.Names
 
 
 def _watch(client: SleeperClient, context: LeagueContext, args: argparse.Namespace) -> None:
-    _, board, biases = _load_simulator(client, context, args)
+    simulator, board, biases, engine_name = _load_simulator(client, context, args)
     draft_id = str(context.draft["draft_id"])
     last_signature: tuple[tuple[int, str], ...] | None = None
+    total = _simulation_total(args)
     print(
-        f"Watching draft every {args.interval:g}s with {_worker_label(args.workers)} "
-        "worker(s). Press Ctrl-C to stop."
+        f"Watching draft every {args.interval:g}s with {engine_name} engine and "
+        f"{_worker_label(args.workers, engine_name)} worker(s), {total:,} rollouts. "
+        "Press Ctrl-C to stop."
     )
 
     while True:
@@ -346,21 +463,81 @@ def _watch(client: SleeperClient, context: LeagueContext, args: argparse.Namespa
             (int(pick["pick_no"]), str(pick["player_id"])) for pick in picks
         )
         if signature != last_signature:
+            started = time.perf_counter()
             context.picks = picks
-            simulator = MonteCarloDraft(context, board, biases, seed=args.seed + len(picks))
+            if hasattr(simulator, "update_picks"):
+                simulator.update_picks(picks, args.seed + len(picks))
+            else:
+                simulator = MonteCarloDraft(
+                    context, board, biases, seed=args.seed + len(picks)
+                )
+            prepared = time.perf_counter()
             print(f"\nBoard updated: {len(picks)} pick(s) complete")
             _print_report(
                 context,
-                simulator.recommend(args.simulations, args.candidates, args.workers),
+                simulator.recommend(total, args.candidates, args.workers),
+            )
+            simulated = time.perf_counter()
+            per_candidate = (
+                f" | requested per candidate {args.runs_per_candidate:,}"
+                if args.runs_per_candidate is not None
+                else ""
+            )
+            print(
+                f"Timing: engine {engine_name} | workers "
+                f"{_worker_label(args.workers, engine_name)}{per_candidate} | "
+                f"model preparation {prepared - started:.1f}s | "
+                f"simulations {simulated - prepared:.1f}s | "
+                f"total {simulated - started:.1f}s"
             )
             last_signature = signature
         time.sleep(args.interval)
+
+
+def _manage_team(client: SleeperClient, args: argparse.Namespace) -> None:
+    from .management import TeamService
+
+    report = TeamService(client).advise(
+        _league_id(args), args.username, action=args.command, week=args.week,
+        mode=args.mode, limit=args.limit, refresh=args.refresh,
+        confirm_tiers_week=args.confirm_tiers_week, expected_season=args.season,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, allow_nan=False))
+        return
+    print(f"{report['league_name']} | {report['season']} week {report['week']} | {report['scoring']['ppr']:g} PPR")
+    print(report["method"])
+    lineup = report["lineup"]
+    print(f"Projected starters: {lineup['projected_points']:.2f} points")
+    for row in lineup["starters"]:
+        points = "no projection" if row.get("points") is None else f"{row['points']:.2f} pts"
+        print(f"  {row['slot']:12s} {row.get('name') or 'Empty slot':28s} {points}")
+    for item in report["suggestions"]:
+        if args.command == "waivers":
+            drop = item.get("drop")
+            print(f"Add {item['add']['name']} / drop {drop['name'] if drop else 'nobody (open slot)'}: {item['weekly_gain']:+.2f} weekly points")
+        else:
+            give = ", ".join(p["name"] for p in item["give"])
+            receive = ", ".join(p["name"] for p in item["receive"])
+            print(f"Team {item['partner_roster_id']}: send {give}; receive {receive}. You {item['weekly_gain']:+.2f}, partner {item['partner_weekly_gain']:+.2f} weekly points")
+        print(f"  {item['reason']}")
+        for warning in item.get("warnings", []):
+            print(f"  Note: {warning}")
+    if args.command != "lineup" and not report["suggestions"]:
+        print("No improving moves met the data and balance requirements.")
+    for warning in report["warnings"]:
+        print(f"Note: {warning}")
+    for source in report["sources"]:
+        print(f"Source: {json.dumps(source)}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     client = SleeperClient()
     try:
+        if args.command in {"lineup", "waivers", "trades"}:
+            _manage_team(client, args)
+            return 0
         context = client.sync(_league_id(args), args.username)
         _print_league(context)
         if args.command == "league":

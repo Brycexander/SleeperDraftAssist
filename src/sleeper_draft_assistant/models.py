@@ -23,8 +23,14 @@ class Player:
     ecr: float
     uncertainty: float
     bye: int | None = None
+    online_projected_points: float = 0.0
+    historical_points: float = 0.0
+    history_weight: float = 0.0
     projected_points: float = 0.0
     vorp: float = 0.0
+    projection_component: float = 0.0
+    consensus_component: float = 0.0
+    risk_penalty: float = 0.0
     value_score: float = 0.0
     value_rank: float = 999.0
     adp: float | None = None
@@ -108,3 +114,6 @@ class Recommendation:
     mean_score: float
     top_roster_rate: float
     samples: int
+    starter_gain: float = 0.0
+    next_pick_availability: float | None = None
+    wait_cost: float = 0.0

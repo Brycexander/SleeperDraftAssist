@@ -13,12 +13,15 @@ import unicodedata
 from typing import Any
 
 from bs4 import BeautifulSoup
+import nflreadpy
 import numpy as np
+import polars as pl
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .models import FLEX_POSITIONS, LeagueRules, Player, normalize_position
+from .draft_slots import assign_starters, starting_slots
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,12 +40,22 @@ class ValuationDiagnostics:
     projection_counts: dict[str, int]
     adp_counts: dict[str, int]
     replacement_points: dict[str, float]
+    historical_players: int = 0
+    history_seasons: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class ValuationResult:
     players: tuple[Player, ...]
     diagnostics: ValuationDiagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalPerformance:
+    season_equivalent_points: float
+    games: int
+    seasons: int
+    reliability: float
 
 
 FFTODAY_POSITION_IDS = {
@@ -61,6 +74,43 @@ BASE_OUTCOME_CV = {
     "TE": 0.23,
     "K": 0.18,
     "DEF": 0.25,
+}
+
+HISTORY_MAX_WEIGHT = {
+    "QB": 0.20,
+    "RB": 0.25,
+    "WR": 0.25,
+    "TE": 0.22,
+    "K": 0.10,
+    "DEF": 0.0,
+}
+
+HISTORICAL_STAT_MAP = {
+    "completions": "pass_cmp",
+    "attempts": "pass_att",
+    "passing_yards": "pass_yd",
+    "passing_tds": "pass_td",
+    "passing_interceptions": "pass_int",
+    "passing_2pt_conversions": "pass_2pt",
+    "carries": "rush_att",
+    "rushing_yards": "rush_yd",
+    "rushing_tds": "rush_td",
+    "rushing_2pt_conversions": "rush_2pt",
+    "receptions": "rec",
+    "receiving_yards": "rec_yd",
+    "receiving_tds": "rec_td",
+    "receiving_2pt_conversions": "rec_2pt",
+    "fumbles_total": "fum",
+    "fumbles_lost_total": "fum_lost",
+    "special_teams_tds": "st_td",
+    "fg_made": "fgm",
+    "fg_missed": "fgmiss",
+    "fg_made_0_19": "fgm_0_19",
+    "fg_made_20_29": "fgm_20_29",
+    "fg_made_30_39": "fgm_30_39",
+    "fg_made_40_49": "fgm_40_49",
+    "pat_made": "xpm",
+    "pat_missed": "xpmiss",
 }
 
 
@@ -411,6 +461,132 @@ def load_public_sleeper_adp(cache_dir: Path, refresh: bool = False) -> dict[str,
     return adp
 
 
+def _load_historical_frames(
+    cache_dir: Path,
+    seasons: tuple[int, ...],
+    refresh: bool,
+) -> tuple[pl.DataFrame, pl.DataFrame] | None:
+    if not seasons:
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    season_label = f"{seasons[0]}-{seasons[-1]}"
+    stats_cache = cache_dir / f"nflverse-player-stats-{season_label}.parquet"
+    ids_cache = cache_dir / f"ff-playerids-{date.today().isoformat()}.parquet"
+
+    try:
+        if stats_cache.exists() and not refresh:
+            stats = pl.read_parquet(stats_cache)
+        else:
+            stats = nflreadpy.load_player_stats(list(seasons), summary_level="reg")
+            stats.write_parquet(stats_cache)
+    except Exception:
+        previous = sorted(
+            cache_dir.glob(f"nflverse-player-stats-{season_label}.parquet"),
+            reverse=True,
+        )
+        if not previous:
+            return None
+        stats = pl.read_parquet(previous[0])
+
+    try:
+        if ids_cache.exists() and not refresh:
+            player_ids = pl.read_parquet(ids_cache)
+        else:
+            player_ids = nflreadpy.load_ff_playerids()
+            player_ids.write_parquet(ids_cache)
+    except Exception:
+        previous = sorted(cache_dir.glob("ff-playerids-*.parquet"), reverse=True)
+        if not previous:
+            return None
+        player_ids = pl.read_parquet(previous[0])
+    return stats, player_ids
+
+
+def _score_historical_row(row: dict[str, Any], scoring: dict[str, float]) -> float:
+    stats: dict[str, float] = {}
+    for source, target in HISTORICAL_STAT_MAP.items():
+        value = row.get(source)
+        if isinstance(value, (int, float)):
+            stats[target] = float(value)
+    stats["fgm_50p"] = float(row.get("fg_made_50_59") or 0.0) + float(
+        row.get("fg_made_60_") or 0.0
+    )
+    points = sum(value * scoring.get(stat, 0.0) for stat, value in stats.items())
+    position = normalize_position(row.get("position"))
+    if position in FLEX_POSITIONS:
+        points += stats.get("rec", 0.0) * scoring.get(
+            f"bonus_rec_{position.lower()}", 0.0
+        )
+    return max(0.0, points)
+
+
+def load_historical_performance(
+    cache_dir: Path,
+    season: int,
+    rules: LeagueRules,
+    refresh: bool = False,
+    lookback: int = 3,
+) -> dict[str, HistoricalPerformance]:
+    seasons = tuple(range(max(1999, season - lookback), season))
+    frames = _load_historical_frames(cache_dir, seasons, refresh)
+    if frames is None:
+        return {}
+    stats, player_ids = frames
+    required_stats = {"player_id", "season", "position", "games"}
+    required_ids = {"gsis_id", "sleeper_id"}
+    if not required_stats.issubset(stats.columns) or not required_ids.issubset(
+        player_ids.columns
+    ):
+        return {}
+
+    mapping = (
+        player_ids.select(
+            pl.col("gsis_id").cast(pl.String),
+            pl.col("sleeper_id").cast(pl.String),
+        )
+        .drop_nulls()
+        .unique(subset=["gsis_id"], keep="first")
+    )
+    joined = stats.with_columns(pl.col("player_id").cast(pl.String)).join(
+        mapping,
+        left_on="player_id",
+        right_on="gsis_id",
+        how="inner",
+    )
+    observations: dict[str, list[tuple[int, float, int]]] = {}
+    for row in joined.iter_rows(named=True):
+        position = normalize_position(row.get("position"))
+        games = int(row.get("games") or 0)
+        if position not in HISTORY_MAX_WEIGHT or games < 1:
+            continue
+        points = _score_historical_row(row, rules.scoring)
+        sleeper_id = str(row["sleeper_id"])
+        observations.setdefault(sleeper_id, []).append(
+            (int(row["season"]), points, games)
+        )
+
+    latest = seasons[-1]
+    result = {}
+    for sleeper_id, player_seasons in observations.items():
+        weighted_points = 0.0
+        total_weight = 0.0
+        weighted_games = 0.0
+        for played_season, season_points, games in player_seasons:
+            recency = 0.70 ** max(0, latest - played_season)
+            weighted_points += recency * season_points
+            total_weight += recency
+            weighted_games += recency * games
+        if total_weight <= 0.0:
+            continue
+        result[sleeper_id] = HistoricalPerformance(
+            season_equivalent_points=weighted_points / total_weight,
+            games=sum(games for _, _, games in player_seasons),
+            seasons=len(player_seasons),
+            reliability=min(1.0, weighted_games / 30.0),
+        )
+    return result
+
+
 def _injury_and_role_risk(metadata: dict[str, Any], position: str) -> tuple[float, float, float]:
     injury_status = str(metadata.get("injury_status") or "").lower()
     status = str(metadata.get("status") or "").lower()
@@ -463,6 +639,9 @@ def score_projection(projection: RawProjection, scoring: dict[str, float]) -> fl
     position = projection.position
     if projection.source == "Sleeper":
         points = sum(value * scoring.get(stat, 0.0) for stat, value in stats.items())
+        bonus_stat = f"bonus_rec_{position.lower()}"
+        if position in FLEX_POSITIONS and bonus_stat not in stats:
+            points += stats.get("rec", 0.0) * scoring.get(bonus_stat, 0.0)
         if position == "DEF" and "def_3_and_out" not in stats:
             estimated_three_and_outs = max(
                 42.5, 54.4 + (stats.get("sack", 42.5) - 42.5) * 0.30
@@ -589,6 +768,9 @@ def build_player_values(
         sleeper_adp = {}
     sleeper = load_sleeper_metadata(cache_dir, refresh)
     public_adp = load_public_sleeper_adp(cache_dir, refresh)
+    historical = load_historical_performance(
+        cache_dir, season, rules, refresh=refresh
+    )
     projection_map = {
         (_normalize_name(projection.name), projection.position): projection
         for projection in projections
@@ -623,6 +805,7 @@ def build_player_values(
             replace(
                 player,
                 bye=projection.bye if projection and projection.bye else player.bye,
+                online_projected_points=projected_points,
                 projected_points=projected_points,
                 injury_risk=injury_risk,
                 role_risk=role_risk,
@@ -633,21 +816,46 @@ def build_player_values(
 
     completed: list[Player] = []
     for player in scored:
-        if player.projected_points > 0:
+        if player.projection_source != "ECR-imputed":
             completed.append(player)
             continue
+        imputed = _impute_projection_points(
+            player, known_by_position.get(player.position, [])
+        )
         completed.append(
             replace(
                 player,
-                projected_points=_impute_projection_points(
-                    player, known_by_position.get(player.position, [])
-                ),
+                online_projected_points=imputed,
+                projected_points=imputed,
+            )
+        )
+
+    with_history = []
+    for player in completed:
+        performance = historical.get(player.sleeper_id)
+        if performance is None or player.projected_points <= 0:
+            with_history.append(player)
+            continue
+        max_weight = HISTORY_MAX_WEIGHT.get(player.position, 0.0)
+        role_stability = max(0.25, 1.0 - 0.75 * player.role_risk)
+        history_weight = max_weight * performance.reliability * role_stability
+        historical_points = performance.season_equivalent_points
+        blended_points = (
+            (1.0 - history_weight) * player.online_projected_points
+            + history_weight * historical_points
+        )
+        with_history.append(
+            replace(
+                player,
+                historical_points=historical_points,
+                history_weight=history_weight,
+                projected_points=blended_points,
             )
         )
 
     adp_counts = Counter[str]()
     with_adp = []
-    for player in completed:
+    for player in with_history:
         name_key = _normalize_name(player.name)
         if player.sleeper_id in sleeper_adp:
             adp = sleeper_adp[player.sleeper_id]
@@ -667,14 +875,13 @@ def build_player_values(
             )
         )
 
-    replacement_demand = {
-        "QB": rules.teams * rules.required_count("QB"),
-        "RB": rules.teams * rules.required_count("RB"),
-        "WR": rules.teams * rules.required_count("WR"),
-        "TE": rules.teams * rules.required_count("TE"),
-        "K": rules.teams * rules.required_count("K"),
-        "DEF": rules.teams * rules.required_count("DEF"),
-    }
+    league_starters = assign_starters(
+        ((player.sleeper_id, player.position, player.projected_points) for player in with_adp),
+        starting_slots(rules.roster_positions) * rules.teams,
+    )
+    player_positions = {player.sleeper_id: player.position for player in with_adp}
+    assigned_counts = Counter(player_positions[player_id] for player_id in league_starters.values())
+    replacement_demand = {position: assigned_counts[position] for position in FFTODAY_POSITION_IDS}
     points_by_position = {
         position: sorted(
             (player.projected_points for player in with_adp if player.position == position),
@@ -682,18 +889,6 @@ def build_player_values(
         )
         for position in replacement_demand
     }
-    for _ in range(rules.teams * rules.flex_slots):
-        flex_candidates = {
-            position: points[replacement_demand[position]]
-            for position in FLEX_POSITIONS
-            if (points := points_by_position.get(position, []))
-            and replacement_demand[position] < len(points)
-        }
-        if not flex_candidates:
-            break
-        selected_position = max(flex_candidates, key=flex_candidates.get)
-        replacement_demand[selected_position] += 1
-
     replacements = {}
     for position, demand in replacement_demand.items():
         position_points = points_by_position[position]
@@ -722,9 +917,21 @@ def build_player_values(
     for player in with_vorp:
         projection_signal = float(np.clip(player.vorp / vorp_scale, -0.5, 1.0))
         ecr_signal = math.exp(-(player.ecr - 1.0) / 80.0)
-        risk_penalty = 0.10 * player.injury_risk + 0.06 * player.role_risk
-        value_score = 100.0 * (0.82 * projection_signal + 0.18 * ecr_signal - risk_penalty)
-        scored_values.append(replace(player, value_score=value_score))
+        projection_component = 82.0 * projection_signal
+        consensus_component = 18.0 * ecr_signal
+        risk_penalty = 100.0 * (
+            0.10 * player.injury_risk + 0.06 * player.role_risk
+        )
+        value_score = projection_component + consensus_component - risk_penalty
+        scored_values.append(
+            replace(
+                player,
+                projection_component=projection_component,
+                consensus_component=consensus_component,
+                risk_penalty=risk_penalty,
+                value_score=value_score,
+            )
+        )
 
     ordered = sorted(scored_values, key=lambda player: player.value_score, reverse=True)
     ranked = tuple(
@@ -736,5 +943,7 @@ def build_player_values(
             projection_counts=dict(source_counts),
             adp_counts=dict(adp_counts),
             replacement_points={key: round(value, 2) for key, value in replacements.items()},
+            historical_players=sum(player.history_weight > 0 for player in ranked),
+            history_seasons=tuple(range(max(1999, season - 3), season)),
         ),
     )

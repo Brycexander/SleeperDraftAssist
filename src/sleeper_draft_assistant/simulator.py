@@ -3,12 +3,14 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import os
 from typing import Iterable
 
 import numpy as np
 
+from .draft_slots import SLOT_POSITIONS, assign_starters, starting_slots
 from .models import (
     DraftState,
     FLEX_POSITIONS,
@@ -90,6 +92,14 @@ def _simulation_chunks(simulations: int, workers: int) -> list[int]:
     return [base + int(index < extra) for index in range(workers)]
 
 
+def _log_normal_survival(z: float) -> float:
+    if z < 8.0:
+        return math.log(0.5 * math.erfc(z / math.sqrt(2.0)))
+    inverse_square = 1.0 / (z * z)
+    correction = 1.0 - inverse_square + 3.0 * inverse_square**2 - 15.0 * inverse_square**3 + 105.0 * inverse_square**4
+    return -0.5 * z * z - math.log(z) - 0.5 * math.log(2.0 * math.pi) + math.log(correction)
+
+
 def _recommend_before_turn_worker(
     context: LeagueContext,
     players: list[Player],
@@ -121,13 +131,15 @@ def _recommend_on_clock_worker(
     seed: int,
     candidate_id: str,
     simulations: int,
+    start_run: int = 0,
 ) -> tuple[str, float, int, int]:
     simulator = MonteCarloDraft(context, players, manager_biases, seed=seed)
     candidate = simulator.by_id[candidate_id]
     score_sum = 0.0
     top_count = 0
 
-    for _ in range(simulations):
+    for run in range(start_run, start_run + simulations):
+        simulator.rng = np.random.default_rng(seed + run)
         order, ranks = simulator._sample_opponent_board()
         result = simulator._finish_rollout(
             simulator.base_state.clone(), order, ranks, forced_first_pick=candidate
@@ -218,13 +230,23 @@ def snake_slot_for_pick(pick_number: int, teams: int) -> int:
 
 
 def roster_for_pick(context: LeagueContext, pick_number: int) -> int:
-    slot = snake_slot_for_pick(pick_number, context.rules.teams)
+    draft_type = context.draft.get("type", "snake")
+    if draft_type not in {"snake", "linear"}:
+        raise ValueError(f"Unsupported draft type: {draft_type}. Use a snake or linear draft.")
+    round_number = (pick_number - 1) // context.rules.teams + 1
+    slot = (
+        (pick_number - 1) % context.rules.teams + 1
+        if draft_type == "linear"
+        else snake_slot_for_pick(pick_number, context.rules.teams)
+    )
+    reversal_round = int((context.draft.get("settings") or {}).get("reversal_round", 0) or 0)
+    if draft_type == "snake" and reversal_round > 0 and round_number >= reversal_round:
+        slot = context.rules.teams + 1 - slot
     slot_to_roster = {
         int(key): int(value)
         for key, value in context.draft.get("slot_to_roster_id", {}).items()
     }
     original_roster = slot_to_roster.get(slot, slot)
-    round_number = (pick_number - 1) // context.rules.teams + 1
     for traded in context.traded_picks:
         if (
             int(traded.get("round", -1)) == round_number
@@ -236,8 +258,9 @@ def roster_for_pick(context: LeagueContext, pick_number: int) -> int:
 
 def next_pick_for_roster(context: LeagueContext, start_pick: int, roster_id: int) -> int:
     final_pick = context.rules.teams * context.rules.rounds
+    occupied_picks = {int(pick["pick_no"]) for pick in context.picks}
     for pick_number in range(start_pick, final_pick + 1):
-        if roster_for_pick(context, pick_number) == roster_id:
+        if pick_number not in occupied_picks and roster_for_pick(context, pick_number) == roster_id:
             return pick_number
     return final_pick + 1
 
@@ -252,17 +275,39 @@ class MonteCarloDraft:
     ) -> None:
         self.context = context
         self.rules = context.rules
+        self._starter_slots = starting_slots(self.rules.roster_positions)
+        self._standard_slots = all(slot in {"QB", "RB", "WR", "TE", "K", "DEF", "FLEX"} for slot in self._starter_slots)
+        self._eligible_positions = frozenset().union(*(SLOT_POSITIONS[slot] for slot in self._starter_slots))
+        self._pick_owners = {
+            pick: roster_for_pick(context, pick)
+            for pick in range(1, self.rules.teams * self.rules.rounds + 1)
+        }
+        self._roster_capacities = Counter(self._pick_owners.values())
         self.players = list(players)
         self.by_id = {player.sleeper_id: player for player in self.players}
         self.manager_biases = manager_biases or {}
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         self._add_missing_picked_players()
+        self._projection_means = {player.sleeper_id: self._projected_points(player) for player in self.players}
         self.has_projections = any(player.projected_points > 0 for player in self.players)
         self.value_order = sorted(
             self.players,
             key=lambda player: player.value_rank if self.has_projections else player.ecr,
         )
+        self._tier_gap_rank: dict[str, float] = {}
+        next_at_position: dict[str, Player] = {}
+        for player in reversed(self.value_order):
+            next_player = next_at_position.get(player.position)
+            player_rank = player.value_rank if self.has_projections else player.ecr
+            next_rank = (
+                next_player.value_rank if self.has_projections else next_player.ecr
+            ) if next_player is not None else player_rank
+            self._tier_gap_rank[player.sleeper_id] = max(
+                0.0,
+                next_rank - player_rank,
+            )
+            next_at_position[player.position] = player
         self.base_state = self._state_from_picks()
 
     def _add_missing_picked_players(self) -> None:
@@ -287,18 +332,23 @@ class MonteCarloDraft:
             self.by_id[player_id] = player
 
     def _state_from_picks(self) -> DraftState:
-        roster_ids = set(self.context.roster_to_user)
-        roster_ids.update(range(1, self.rules.teams + 1))
+        roster_ids = set(self._pick_owners.values())
+        slot_to_roster = self.context.draft.get("slot_to_roster_id") or {}
+        roster_ids.update(int(slot_to_roster.get(str(slot), slot_to_roster.get(slot, slot))) for slot in range(1, self.rules.teams + 1))
+        roster_ids.add(self.context.roster_id)
         rosters = {roster_id: [] for roster_id in roster_ids}
         drafted: set[str] = set()
-        highest_pick = 0
+        occupied_picks: set[int] = set()
         for pick in sorted(self.context.picks, key=lambda item: int(item["pick_no"])):
             player_id = str(pick["player_id"])
             roster_id = int(pick["roster_id"])
             rosters.setdefault(roster_id, []).append(player_id)
             drafted.add(player_id)
-            highest_pick = max(highest_pick, int(pick["pick_no"]))
-        return DraftState(next_pick=highest_pick + 1, rosters=rosters, drafted=drafted)
+            occupied_picks.add(int(pick["pick_no"]))
+        next_pick = 1
+        while next_pick in occupied_picks:
+            next_pick += 1
+        return DraftState(next_pick=next_pick, rosters=rosters, drafted=drafted)
 
     def _position_counts(self, roster: list[str]) -> Counter[str]:
         return Counter(
@@ -321,26 +371,28 @@ class MonteCarloDraft:
         roster_size: int,
         counts: Counter[str],
         missing: Counter[str],
+        capacity: int | None = None,
     ) -> bool:
-        if roster_size >= self.rules.rounds:
+        capacity = self.rules.rounds if capacity is None else capacity
+        if roster_size >= capacity or player.position not in self._eligible_positions:
             return False
-        if player.position in {"K", "DEF"} and roster_size < self.rules.rounds - 3:
-            return False
-        skill_cap = max(4, self.rules.flex_slots + 4)
-        caps = {
-            "QB": max(1, self.rules.required_count("QB")),
-            "RB": max(skill_cap, self.rules.required_count("RB")),
-            "WR": max(skill_cap, self.rules.required_count("WR")),
-            "TE": max(2, self.rules.required_count("TE")),
-            "K": max(1, self.rules.required_count("K")),
-            "DEF": max(1, self.rules.required_count("DEF")),
-        }
-        if counts[player.position] >= caps.get(player.position, self.rules.rounds):
-            return False
+        after = counts.copy()
+        after[player.position] += 1
+        missing_after_pick = self._unfilled_slots(tuple(after[position] for position in ("QB", "RB", "WR", "TE", "K", "DEF")))
+        # Traded picks may leave a team fewer selections than starting slots.
+        # Preserve the best feasible number of starters instead of deadlocking.
+        unavoidable_empty = max(0, len(self._starter_slots) - capacity)
+        return missing_after_pick <= capacity - roster_size - 1 + unavoidable_empty
 
-        remaining_after_pick = self.rules.rounds - roster_size - 1
-        missing_after_pick = sum(missing.values()) - int(missing[player.position] > 0)
-        return missing_after_pick <= remaining_after_pick
+    @lru_cache(maxsize=4096)
+    def _unfilled_slots(self, counts: tuple[int, ...]) -> int:
+        positions = ("QB", "RB", "WR", "TE", "K", "DEF")
+        if self._standard_slots:
+            missing = sum(max(0, self.rules.required_count(position) - count) for position, count in zip(positions, counts))
+            spare_flex = sum(max(0, count - self.rules.required_count(position)) for position, count in zip(positions, counts) if position in FLEX_POSITIONS)
+            return missing + max(0, self.rules.flex_slots - spare_flex)
+        candidates = [(f"{position}-{index}", position, 1.0) for position, count in zip(positions, counts) for index in range(count)]
+        return len(self._starter_slots) - len(assign_starters(candidates, self._starter_slots))
 
     def _pick_score(
         self,
@@ -349,6 +401,8 @@ class MonteCarloDraft:
         round_number: int,
         rank: float,
         manager_user_id: str | None = None,
+        pick_number: int | None = None,
+        use_wait_cost: bool = False,
     ) -> float:
         score = float(rank)
         required = self.rules.required_count(player.position)
@@ -363,18 +417,28 @@ class MonteCarloDraft:
             imbalance = counts[other_position] - counts[player.position]
             score -= max(0, imbalance - 1) * 10.0
         elif player.position == "TE" and counts["TE"] >= max(1, required):
-            score += 15.0
+            score += 15.0 * (counts["TE"] - max(1, required) + 1)
         elif player.position == "QB":
             if not self.has_projections:
                 score += max(0, 12 - self.rules.teams) * 2.0
                 score -= max(0.0, self.rules.scoring.get("pass_td", 4.0) - 4.0) * 3.0
-            if counts["QB"] >= 1:
-                score += 30.0 if round_number < 12 else 18.0
+            qb_target = self.rules.required_count("QB") + self._starter_slots.count("SUPER_FLEX")
+            if counts["QB"] >= max(1, qb_target):
+                score += (30.0 if round_number < 12 else 18.0) + 40.0 * (counts["QB"] - max(1, qb_target))
         elif player.position in {"K", "DEF"} and round_number < self.rules.rounds - 2:
             score += 85.0
+        if player.position in {"K", "DEF"} and counts[player.position] >= required:
+            score += 100.0 * (counts[player.position] - required + 1)
 
         if manager_user_id:
             score += self.manager_biases.get(manager_user_id, {}).get(player.position, 0.0)
+        if use_wait_cost and pick_number is not None:
+            next_availability = self._next_turn_availability(player, pick_number)
+            if next_availability is not None:
+                urgency = (1.0 - next_availability) * self._tier_gap_rank.get(
+                    player.sleeper_id, 0.0
+                )
+                score -= min(12.0, urgency)
         return score
 
     def _ordered_candidates(
@@ -393,7 +457,7 @@ class MonteCarloDraft:
         candidates: list[tuple[float, Player]] = []
         for player in order:
             if player.sleeper_id in state.drafted or not self._can_add(
-                player, len(roster), counts, missing
+                player, len(roster), counts, missing, self._roster_capacities.get(roster_id, self.rules.rounds)
             ):
                 continue
             rank = (
@@ -401,7 +465,15 @@ class MonteCarloDraft:
                 if ranks is not None
                 else (player.value_rank if self.has_projections else player.ecr)
             )
-            score = self._pick_score(player, counts, round_number, rank, manager_user_id)
+            score = self._pick_score(
+                player,
+                counts,
+                round_number,
+                rank,
+                manager_user_id,
+                pick_number=state.next_pick,
+                use_wait_cost=roster_id == self.context.roster_id,
+            )
             candidates.append((score, player))
             if len(candidates) >= limit:
                 break
@@ -448,14 +520,17 @@ class MonteCarloDraft:
 
     @staticmethod
     def _fallback_projected_points(player: Player) -> float:
-        return 17.0 * 220.0 / math.log2(player.ecr + 4.0)
+        return max(1.0, 260.0 * math.exp(-player.ecr / 100.0))
+
+    def _projected_points(self, player: Player) -> float:
+        if player.projected_points > 0 or player.projection_source != "ECR fallback":
+            return max(0.0, player.projected_points)
+        return self._fallback_projected_points(player)
 
     def _sample_outcome_points(self) -> dict[str, float]:
         means = np.array(
             [
-                player.projected_points
-                if player.projected_points > 0
-                else self._fallback_projected_points(player)
+                self._projected_points(player)
                 for player in self.players
             ],
             dtype=float,
@@ -471,47 +546,150 @@ class MonteCarloDraft:
         )
         sigmas = np.sqrt(np.log1p(cvs**2))
         sampled = self.rng.lognormal(np.log(np.maximum(means, 1.0)) - 0.5 * sigmas**2, sigmas)
+        sampled[means <= 0] = 0.0
         return {
             player.sleeper_id: float(points)
             for player, points in zip(self.players, sampled, strict=True)
         }
 
-    def _lineup_score(self, roster: list[str], outcome_points: dict[str, float]) -> float:
+    def _lineup_score(self, roster: list[str], outcome_points: dict[str, float], *, include_bench: bool = True, projected_selection: bool = False) -> float:
         remaining = [self.by_id[player_id] for player_id in roster if player_id in self.by_id]
         selected: list[Player] = []
+        selection_points = self._projection_means if projected_selection else outcome_points
+
+        if not self._standard_slots:
+            selected_ids = set(assign_starters(
+                ((player.sleeper_id, player.position, selection_points[player.sleeper_id]) for player in remaining),
+                self._starter_slots,
+            ).values())
+            selected = [player for player in remaining if player.sleeper_id in selected_ids]
+            remaining = [player for player in remaining if player.sleeper_id not in selected_ids]
 
         def take(position: str, count: int) -> None:
             eligible = [player for player in remaining if player.position == position]
             eligible.sort(
-                key=lambda player: outcome_points[player.sleeper_id],
+                key=lambda player: selection_points[player.sleeper_id],
                 reverse=True,
             )
             for player in eligible[:count]:
                 selected.append(player)
                 remaining.remove(player)
 
-        for position in ("QB", "RB", "WR", "TE", "K", "DEF"):
-            take(position, self.rules.required_count(position))
+        if self._standard_slots:
+            for position in ("QB", "RB", "WR", "TE", "K", "DEF"):
+                take(position, self.rules.required_count(position))
 
         flex = [player for player in remaining if player.position in FLEX_POSITIONS]
         flex.sort(
-            key=lambda player: outcome_points[player.sleeper_id],
+            key=lambda player: selection_points[player.sleeper_id],
             reverse=True,
         )
-        for player in flex[: self.rules.flex_slots]:
+        for player in flex[: self.rules.flex_slots if self._standard_slots else 0]:
             selected.append(player)
             remaining.remove(player)
 
         starter_score = sum(outcome_points[player.sleeper_id] for player in selected)
         bench = sorted(
             (
-                outcome_points[player.sleeper_id]
+                player.sleeper_id
                 for player in remaining
                 if player.position in FLEX_POSITIONS | {"QB"}
             ),
+            key=selection_points.get,
             reverse=True,
         )
-        return (starter_score + 0.08 * sum(bench[:4])) / 17.0
+        return (starter_score + (0.08 * sum(outcome_points[player_id] for player_id in bench[:4]) if include_bench else 0.0)) / 17.0
+
+    def recommendation_metrics(
+        self, player: Player
+    ) -> tuple[float, float | None, float]:
+        """Explain team fit and the opportunity cost of waiting one user turn."""
+        projected = {
+            candidate.sleeper_id: (
+                self._projected_points(candidate)
+            )
+            for candidate in self.players
+        }
+        roster = list(
+            self.base_state.rosters.get(self.context.roster_id, [])
+        )
+        current_value = 17.0 * self._lineup_score(roster, projected, include_bench=False)
+        with_player = 17.0 * self._lineup_score(
+            [*roster, player.sleeper_id], projected, include_bench=False
+        )
+        starter_gain = max(0.0, with_player - current_value)
+
+        next_pick_availability = self._next_turn_availability(
+            player, next_pick_for_roster(self.context, self.base_state.next_pick, self.context.roster_id)
+        )
+        if next_pick_availability is None:
+            return starter_gain, None, 0.0
+
+        next_tier = next(
+            (
+                candidate
+                for candidate in self.value_order
+                if candidate.position == player.position
+                and candidate.value_rank > player.value_rank
+                and candidate.sleeper_id not in self.base_state.drafted
+            ),
+            None,
+        )
+        tier_drop = max(
+            0.0,
+            player.vorp - (next_tier.vorp if next_tier is not None else 0.0),
+        )
+        wait_cost = (1.0 - next_pick_availability) * tier_drop
+        return starter_gain, next_pick_availability, wait_cost
+
+    def _next_turn_availability(
+        self, player: Player, current_pick: int
+    ) -> float | None:
+        final_pick = self.rules.teams * self.rules.rounds
+        following_pick = next_pick_for_roster(
+            self.context, current_pick + 1, self.context.roster_id
+        )
+        if following_pick > final_pick:
+            return None
+        if following_pick == current_pick + 1:
+            return 1.0
+        adp_mean = player.adp if player.adp is not None else player.ecr
+        adp_sigma = (
+            max(1.25, player.adp_uncertainty)
+            if player.adp is not None
+            else max(1.25, player.uncertainty * 1.1)
+        )
+
+        # Condition the market distribution on the observed fact that this
+        # player has survived to the current pick. Use log probabilities so
+        # unexpectedly falling players retain a valid conditional estimate.
+        log_now = _log_normal_survival((current_pick - 0.5 - adp_mean) / adp_sigma)
+        log_later = _log_normal_survival((following_pick - 0.5 - adp_mean) / adp_sigma)
+        return min(1.0, math.exp(min(0.0, log_later - log_now)))
+
+    def _recommendation_entry(
+        self,
+        player: Player,
+        availability_rate: float,
+        selection_rate: float,
+        mean_score: float,
+        top_roster_rate: float,
+        samples: int,
+    ) -> Recommendation:
+        starter_gain, next_pick_availability, wait_cost = (
+            self.recommendation_metrics(player)
+        )
+        return Recommendation(
+            player=player,
+            availability_rate=availability_rate,
+            selection_rate=selection_rate,
+            mean_score=mean_score,
+            top_roster_rate=top_roster_rate,
+            samples=samples,
+            starter_gain=starter_gain,
+            next_pick_availability=next_pick_availability,
+            wait_cost=wait_cost,
+        )
 
     def _finish_rollout(
         self,
@@ -527,12 +705,16 @@ class MonteCarloDraft:
         first_selection = ""
         availability: set[str] = set()
         user_picks = [
-            (int(pick["round"]), str(pick["player_id"]))
+            (int(pick.get("round") or ((int(pick["pick_no"]) - 1) // self.rules.teams + 1)), str(pick["player_id"]))
             for pick in sorted(self.context.picks, key=lambda item: int(item["pick_no"]))
             if int(pick["roster_id"]) == self.context.roster_id
         ]
 
+        occupied_picks = {int(pick["pick_no"]) for pick in self.context.picks}
         while state.next_pick <= final_pick:
+            if state.next_pick in occupied_picks:
+                state.next_pick += 1
+                continue
             pick_number = state.next_pick
             round_number = (pick_number - 1) // self.rules.teams + 1
             roster_id = roster_for_pick(self.context, pick_number)
@@ -541,7 +723,7 @@ class MonteCarloDraft:
             if pick_number == first_user_pick:
                 availability = {
                     player.sleeper_id
-                    for player in self.value_order[:40]
+                    for player in self.value_order
                     if player.sleeper_id not in state.drafted
                 }
 
@@ -565,7 +747,7 @@ class MonteCarloDraft:
 
         outcome_points = self._sample_outcome_points()
         scores = {
-            roster_id: self._lineup_score(roster, outcome_points)
+            roster_id: self._lineup_score(roster, outcome_points, projected_selection=True)
             for roster_id, roster in state.rosters.items()
         }
         user_score = scores[self.context.roster_id]
@@ -575,7 +757,7 @@ class MonteCarloDraft:
             top_roster=user_score >= max(scores.values()),
             availability=frozenset(availability),
             roster_scores=scores,
-            user_picks=tuple(user_picks),
+            user_picks=tuple(sorted(user_picks, key=lambda item: item[0])),
         )
 
     @staticmethod
@@ -804,9 +986,13 @@ class MonteCarloDraft:
     ) -> SimulationReport:
         if simulations < 1:
             raise ValueError("simulations must be at least 1")
+        if candidate_count < 1:
+            raise ValueError("candidate_count must be at least 1")
         next_user_pick = next_pick_for_roster(
             self.context, self.base_state.next_pick, self.context.roster_id
         )
+        if next_user_pick > self.rules.teams * self.rules.rounds:
+            return SimulationReport(next_user_pick, False, 0, ())
         on_clock = next_user_pick == self.base_state.next_pick
         if on_clock:
             return self._recommend_on_clock(
@@ -859,13 +1045,13 @@ class MonteCarloDraft:
         for player_id, samples in selected.most_common(12):
             player = self.by_id[player_id]
             recommendations.append(
-                Recommendation(
-                    player=player,
-                    availability_rate=available[player_id] / simulations,
-                    selection_rate=samples / simulations,
-                    mean_score=score_sum[player_id] / samples,
-                    top_roster_rate=top_sum[player_id] / samples,
-                    samples=samples,
+                self._recommendation_entry(
+                    player,
+                    available[player_id] / simulations,
+                    samples / simulations,
+                    score_sum[player_id] / samples,
+                    top_sum[player_id] / samples,
+                    samples,
                 )
             )
         return SimulationReport(
@@ -890,15 +1076,21 @@ class MonteCarloDraft:
             None,
             limit=max(40, candidate_count * 4),
         )[:candidate_count]
-        per_candidate = max(25, simulations // max(1, len(candidates)))
+        if not candidates:
+            raise RuntimeError("No legal player is available for the user's next pick")
+        total_rollouts = max(simulations, 25 * len(candidates))
+        candidate_samples = _simulation_chunks(total_rollouts, len(candidates))
         recommendations = []
 
         worker_count = _resolve_workers(workers)
         if worker_count == 1:
-            for candidate in candidates:
+            for candidate, per_candidate in zip(candidates, candidate_samples, strict=True):
                 score_sum = 0.0
                 top_count = 0
-                for _ in range(per_candidate):
+                for run in range(per_candidate):
+                    # Compare candidates against the same sampled boards and
+                    # player outcomes, avoiding independent-sample ranking noise.
+                    self.rng = np.random.default_rng(self.seed + 20_000 + run)
                     order, ranks = self._sample_opponent_board()
                     result = self._finish_rollout(
                         self.base_state.clone(), order, ranks, forced_first_pick=candidate
@@ -906,27 +1098,30 @@ class MonteCarloDraft:
                     score_sum += result.user_score
                     top_count += int(result.top_roster)
                 recommendations.append(
-                    Recommendation(
-                        player=candidate,
-                        availability_rate=1.0,
-                        selection_rate=1.0,
-                        mean_score=score_sum / per_candidate,
-                        top_roster_rate=top_count / per_candidate,
-                        samples=per_candidate,
+                    self._recommendation_entry(
+                        candidate,
+                        1.0,
+                        1.0,
+                        score_sum / per_candidate,
+                        top_count / per_candidate,
+                        per_candidate,
                     )
                 )
         else:
             tasks = []
-            for candidate_index, candidate in enumerate(candidates):
+            for candidate, per_candidate in zip(candidates, candidate_samples, strict=True):
                 chunks = _simulation_chunks(per_candidate, worker_count)
-                for chunk_index, chunk in enumerate(chunks):
+                start_run = 0
+                for chunk in chunks:
                     tasks.append(
                         (
-                            self.seed + 20_000 + candidate_index * 1_000 + chunk_index,
+                            self.seed + 20_000,
                             candidate.sleeper_id,
                             chunk,
+                            start_run,
                         )
                     )
+                    start_run += chunk
             with ProcessPoolExecutor(max_workers=worker_count) as executor:
                 worker_results = list(
                     executor.map(
@@ -934,9 +1129,10 @@ class MonteCarloDraft:
                         [self.context] * len(tasks),
                         [self.players] * len(tasks),
                         [self.manager_biases] * len(tasks),
-                        [seed for seed, _, _ in tasks],
-                        [candidate_id for _, candidate_id, _ in tasks],
-                        [chunk for _, _, chunk in tasks],
+                        [seed for seed, _, _, _ in tasks],
+                        [candidate_id for _, candidate_id, _, _ in tasks],
+                        [chunk for _, _, chunk, _ in tasks],
+                        [start for _, _, _, start in tasks],
                     )
                 )
 
@@ -952,13 +1148,13 @@ class MonteCarloDraft:
             for candidate in candidates:
                 score_sum, top_count, samples = by_candidate[candidate.sleeper_id]
                 recommendations.append(
-                    Recommendation(
-                        player=candidate,
-                        availability_rate=1.0,
-                        selection_rate=1.0,
-                        mean_score=float(score_sum) / int(samples),
-                        top_roster_rate=int(top_count) / int(samples),
-                        samples=int(samples),
+                    self._recommendation_entry(
+                        candidate,
+                        1.0,
+                        1.0,
+                        float(score_sum) / int(samples),
+                        int(top_count) / int(samples),
+                        int(samples),
                     )
                 )
 
@@ -968,6 +1164,6 @@ class MonteCarloDraft:
         return SimulationReport(
             next_user_pick=next_user_pick,
             on_clock=True,
-            total_rollouts=per_candidate * len(candidates),
+            total_rollouts=total_rollouts,
             recommendations=tuple(recommendations),
         )
