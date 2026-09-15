@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import logging
 import os
+from pathlib import Path
 import secrets
 import threading
 import time
@@ -26,6 +27,8 @@ from .simulator import SimulationReport
 from .sleeper import SleeperClient
 from .valuation import build_player_values
 from .management import TeamService
+from .expert_sources import import_expert_snapshot
+from .expert_data import ExpertSnapshot
 from .team_ui import TEAM_HTML
 
 
@@ -63,6 +66,9 @@ class TeamRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=25)
     refresh: bool = False
     confirm_tiers_week: bool = False
+    trade_approach: Literal["balanced", "opportunities"] = "balanced"
+    valuation_source: Literal["sleeper", "experts"] = "sleeper"
+    show_ppr_tiers: bool = False
 
     @model_validator(mode="after")
     def validate_league(self) -> TeamRequest:
@@ -406,12 +412,40 @@ async def api_team(request: Request, options: TeamRequest):
             username=options.username, action=options.action, week=options.week,
             mode=options.mode, limit=options.limit, refresh=options.refresh,
             confirm_tiers_week=options.confirm_tiers_week, expected_season=options.season,
+            trade_approach=options.trade_approach, valuation_source=options.valuation_source,
+            show_ppr_tiers=options.show_ppr_tiers,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         LOGGER.exception("Unable to produce team advice")
         raise HTTPException(status_code=502, detail="Could not load team advice. Try refreshing the data.") from exc
+
+
+@app.post("/api/team/expert-snapshot")
+async def import_team_expert_snapshot(request: Request):
+    _require_auth(request)
+    length = request.headers.get("content-length")
+    if length and (not length.isdigit() or int(length) > 2 * 1024 * 1024):
+        raise HTTPException(status_code=413, detail="Expert snapshot exceeds the 2 MiB limit")
+    raw = await request.body()
+    if len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Expert snapshot exceeds the 2 MiB limit")
+    try:
+        state = await asyncio.to_thread(team_service.client.nfl_state)
+        snapshot = ExpertSnapshot.model_validate_json(raw)
+        target = Path(os.environ.get("EXPERT_SNAPSHOT_DIR", str(cache_directory())))
+        result = await asyncio.to_thread(import_expert_snapshot, raw, target,
+                                         season=int(state["season"]), week=int(snapshot.week),
+                                         scoring=snapshot.scoring, now=datetime.now().astimezone())
+        if result.get("status") != "ready":
+            return JSONResponse(result, status_code=422)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        LOGGER.exception("Unable to import expert snapshot")
+        raise HTTPException(status_code=400, detail="Invalid expert snapshot") from exc
 
 
 @app.get("/api/status")

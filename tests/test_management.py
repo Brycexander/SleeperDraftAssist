@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from sleeper_draft_assistant.management import TeamService
+from sleeper_draft_assistant.expert_data import ExpertBoard, ExpertValue
 from sleeper_draft_assistant.strategy import WeeklyPlayer
 from sleeper_draft_assistant import web
 
@@ -54,7 +55,7 @@ def service(tmp_path):
     def loader(cache_dir, season, week, scoring, **kwargs):
         calls.append((season, week, scoring, kwargs))
         return SimpleNamespace(players=players, warnings=[], sources=[{"name": "Fixture", "season": season, "week": week}])
-    result = TeamService(Client(), loader, tmp_path)
+    result = TeamService(Client(), loader, tmp_path, expert_loader=loader)
     result.calls = calls
     return result
 
@@ -68,10 +69,91 @@ def test_weekly_advice_uses_live_ownership_scoring_and_excludes_reserve(service)
     assert report["week"] == 2
 
 
+def test_lineup_can_include_ppr_tier_charts_with_active_roster_marks(service, monkeypatch):
+    monkeypatch.setattr(
+        "sleeper_draft_assistant.management.load_ppr_tier_charts",
+        lambda *args, **kwargs: (
+            [{"position": "RB", "tiers": [{"tier": 1, "players": [{"name": "RB", "active_roster": True}]}]}],
+            ["chart note"],
+            [{"name": "Fantasy Football Tiers RB PPR"}],
+        ),
+    )
+    report = service.advise("42", "example", show_ppr_tiers=True)
+    assert report["ppr_tiers"][0]["position"] == "RB"
+    assert report["ppr_tiers"][0]["tiers"][0]["players"][0]["active_roster"] is True
+    assert "chart note" in report["warnings"]
+    assert report["ppr_tier_sources"][0]["name"].endswith("PPR")
+
+
 def test_waiver_open_slot_does_not_drop_and_excludes_opponents(service):
     report = service.advise("42", "example", action="waivers")
     assert report["suggestions"][0]["add"]["player_id"] == "free"
     assert report["suggestions"][0]["drop"] is None
+
+
+def test_expert_report_exposes_selected_panel_scores(service, monkeypatch):
+    from sleeper_draft_assistant import management
+    values = {
+        pid: ExpertValue(pid, position, rank, rank, rank, ("e1", "e2", "e3", "e4", "e5"), rank, 5 - rank / 10)
+        for pid, position, rank in (("qb", "QB", 1), ("rb", "RB", 2), ("wr", "WR", 3), ("free", "WR", 4), ("taken", "RB", 5))
+    }
+    board = ExpertBoard(
+        values, ("e1", "e2", "e3", "e4", "e5"), 100,
+        panel_scores=(("e1", .91), ("e2", .89), ("e3", .87), ("e4", .85), ("e5", .83)),
+    )
+    monkeypatch.setattr(management, "load_expert_board", lambda *args, **kwargs: (
+        "ready", board, [{"name": "fixture experts", "excluded_experts": [
+            {"expert_id": "e6", "reason": "publisher_limit", "detail": "publisher already represented twice"}
+        ]}], []
+    ))
+
+    report = service.advise("42", "example", action="waivers", valuation_source="experts")
+
+    assert report["expert_selection"] == [
+        {"expert_id": "e1", "score": .91}, {"expert_id": "e2", "score": .89},
+        {"expert_id": "e3", "score": .87}, {"expert_id": "e4", "score": .85},
+        {"expert_id": "e5", "score": .83},
+    ]
+    assert report["expert_exclusions"] == [
+        {"expert_id": "e6", "reason": "publisher_limit", "detail": "publisher already represented twice"}
+    ]
+
+
+def test_expert_moves_use_projection_free_player_universe(service, monkeypatch):
+    from sleeper_draft_assistant import management
+    original_loader = service.loader
+
+    def weekly_with_projection_only_player(*args, **kwargs):
+        data = original_loader(*args, **kwargs)
+        players = dict(data.players)
+        players["phantom"] = WeeklyPlayer("phantom", "Projection Only", "WR", "CHI", 99, roster_value=99)
+        return SimpleNamespace(players=players, warnings=data.warnings, sources=data.sources)
+
+    expert_calls = []
+
+    def metadata_only(*args, **kwargs):
+        expert_calls.append(True)
+        data = original_loader(*args, **kwargs)
+        return SimpleNamespace(players=data.players, warnings=["projection-free fixture"], sources=[])
+
+    service.loader = weekly_with_projection_only_player
+    service.expert_loader = metadata_only
+    ranks = (("qb", "QB", 1, 5), ("rb", "RB", 2, 4), ("wr", "WR", 3, 3),
+             ("free", "WR", 4, 2), ("taken", "RB", 5, 1), ("phantom", "WR", 1, 10))
+    board = ExpertBoard(
+        {pid: ExpertValue(pid, position, rank, rank, rank, ("e1", "e2", "e3", "e4", "e5"), rank, credit)
+         for pid, position, rank, credit in ranks},
+        ("e1", "e2", "e3", "e4", "e5"), 100,
+    )
+    monkeypatch.setattr(management, "load_expert_board", lambda *args, **kwargs: (
+        "ready", board, [{"name": "fixture experts"}], []
+    ))
+
+    report = service.advise("42", "example", action="waivers", valuation_source="experts")
+
+    assert expert_calls
+    assert {item["add"]["player_id"] for item in report["suggestions"]} == {"free"}
+    assert any("projection-free" in warning for warning in report["warnings"])
 
 
 def test_disabled_additions_and_trade_deadline(service):
@@ -155,6 +237,9 @@ def test_team_routes_require_auth_and_serve_working_advice(service, monkeypatch)
     assert asyncio.run(_http("/api/team/state"))[0] == 401
     status, content = asyncio.run(_http("/team", cookie=token))
     assert status == 200 and b"Find my starting lineup" in content
+    assert b"Rolling multi-year expert ROS ranks" in content
+    assert b"Expert agreement" in content
+    assert b"Excluded expert candidates" in content
     status, content = asyncio.run(_http("/api/team", {"league_id": "42"}, cookie=token))
     assert status == 200
     assert json.loads(content)["lineup"]["projected_points"] == 42
@@ -170,3 +255,31 @@ def test_weekly_cli_bypasses_draft_sync(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_manage_team", lambda client, args: print(f"{args.command}:{args.week}:{args.mode}"))
     assert cli.main(["lineup", "--week", "2", "--mode", "tiers"]) == 0
     assert "lineup:2:tiers" in capsys.readouterr().out
+
+
+def test_opportunity_mode_returns_explicit_early_season_status(service, monkeypatch):
+    from sleeper_draft_assistant import trade_history
+    monkeypatch.setattr(trade_history, "_fetch", lambda *a, **k: pytest.fail("No prior-season or partial-week data should load"))
+    service.client.nfl_state = lambda: {"season": "2026", "week": 1, "season_type": "regular"}
+    report = service.advise("42", "example", action="trades", trade_approach="opportunities")
+    assert report["trade_approach"] == "opportunities"
+    assert report["suggestions"] == []
+    assert any("completed" in w.lower() for w in report["warnings"])
+    assert report["trend_players"]
+
+
+def test_trade_approach_rejects_unknown_and_nontrade_use(service):
+    with pytest.raises(ValueError):
+        service.advise("42", "example", action="trades", trade_approach="invented")
+    with pytest.raises(ValueError):
+        service.advise("42", "example", action="waivers", trade_approach="opportunities")
+
+
+def test_team_api_exposes_opportunity_mode(service, monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD_HASH", hashlib.sha256(b"example").hexdigest())
+    monkeypatch.setenv("SESSION_SECRET", "fixture-session-secret")
+    monkeypatch.setattr(web, "team_service", service)
+    service.client.nfl_state = lambda: {"season": "2026", "week": 1, "season_type": "regular"}
+    status, body = asyncio.run(_http("/api/team", {"league_id": "42", "action": "trades", "trade_approach": "opportunities"}, web._session_token()))
+    assert status == 200
+    assert json.loads(body)["trade_approach"] == "opportunities"

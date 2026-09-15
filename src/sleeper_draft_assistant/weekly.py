@@ -314,6 +314,98 @@ def _load_tiers(cache_dir: Path, season: int, week: int, scoring: dict[str, floa
         return players, [f"Fantasy Football Tiers unavailable: {error}"], sources
 
 
+def load_expert_players(
+    cache_dir: Path, season: int, week: int, scoring: dict[str, float],
+    refresh: bool = False, confirm_tiers_week: bool = False,
+) -> WeeklyData:
+    """Load player identity and transaction locks without projection feeds."""
+    if not 2009 <= season <= 2100 or not 1 <= week <= 18:
+        raise ValueError("Choose an NFL season and regular-season week 1–18")
+    if any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in scoring.values()):
+        raise ValueError("Scoring weights must be finite numbers")
+    warnings = ["Expert transaction player eligibility uses Sleeper metadata and game locks; it does not load projection or tier feeds."]
+    sources: list[dict[str, Any]] = []
+    specs = {
+        "players": ("Sleeper player metadata", "https://api.sleeper.app/v1/players/nfl", 86400, None),
+        "schedule": ("Sleeper NFL schedule", f"https://api.sleeper.com/schedule/nfl/regular/{season}", 60, None),
+        "kickoffs": ("ESPN kickoff times", "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard", 300, {"dates": season, "seasontype": 2, "week": week, "limit": 1000}),
+    }
+    fetched: dict[str, _Fetched] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            key: pool.submit(_fetch, cache_dir, f"{key}-{season}-{week}", url, ttl, refresh, params=params)
+            for key, (_, url, ttl, params) in specs.items()
+        }
+        for key, future in futures.items():
+            label, url, _, _ = specs[key]
+            try:
+                value = future.result()
+                fetched[key] = value
+                sources.append(_source(label, value, season, week, status="loaded"))
+            except (requests.RequestException, ValueError, TypeError, OSError) as error:
+                warnings.append(f"{label} unavailable: {error}")
+                sources.append({"name": label, "url": url, "status": "unavailable", "season": season, "week": week})
+
+    metadata = fetched["players"].data if "players" in fetched and isinstance(fetched["players"].data, dict) else {}
+    games: list[dict[str, Any]] = []
+    kickoffs: dict[frozenset[str], tuple[datetime, bool]] = {}
+    try:
+        if "schedule" in fetched:
+            games = _schedule_games(fetched["schedule"].data, week)
+    except (ValueError, TypeError, KeyError) as error:
+        warnings.append(f"Sleeper NFL schedule unusable: {error}")
+    try:
+        if "kickoffs" in fetched:
+            kickoffs = _kickoffs(fetched["kickoffs"].data, season, week)
+    except (ValueError, TypeError, KeyError) as error:
+        warnings.append(f"ESPN kickoff times unusable: {error}")
+
+    team_games = {_team(row[key]): row for row in games for key in ("home", "away")}
+    locks: dict[str, bool] = {}
+    conservative = False
+    now = _now()
+    for team, game in team_games.items():
+        pair = frozenset((_team(game["home"]), _team(game["away"])))
+        kickoff = kickoffs.get(pair)
+        status = str(game.get("status") or "").lower()
+        already_started = status in {"in_progress", "in_game", "complete", "completed", "post_game", "final"}
+        if kickoff:
+            locks[team] = already_started or kickoff[1] or now >= kickoff[0]
+        else:
+            conservative = True
+            game_date = str(game.get("date") or "")[:10]
+            locks[team] = already_started or not game_date or game_date <= now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    if not games:
+        warnings.append("NFL schedule unavailable or incomplete: all expert-mode roster moves are conservatively locked.")
+    elif conservative:
+        warnings.append("Some kickoff times are unavailable: affected expert-mode roster moves are conservatively locked.")
+
+    players: dict[str, WeeklyPlayer] = {}
+    for raw_id, raw in metadata.items():
+        if not isinstance(raw, dict):
+            continue
+        player_id = str(raw_id)
+        position = normalize_position(raw.get("position"))
+        team = _team(raw.get("team"))
+        name = raw.get("full_name") or " ".join(str(raw.get(key) or "") for key in ("first_name", "last_name")).strip() or player_id
+        status = str(raw.get("status") or "")
+        injury = str(raw.get("injury_status") or "")
+        if injury and status.lower() in {"", "active"}:
+            status = injury
+        if not team:
+            status = status if status.lower() in {"inactive", "retired"} else "No NFL team"
+        eligible = tuple(normalize_position(value) for value in raw.get("fantasy_positions") or [position])
+        players[player_id] = WeeklyPlayer(
+            player_id=player_id, name=name, position=position, team=team,
+            points=None, roster_value=0.0, status=status, eligible_positions=eligible,
+            locked=locks.get(team, not bool(games)),
+            bye=bool(team in _TEAMS and games and team not in team_games),
+            rosterable=bool(team in _TEAMS and position in _POSITIONS and status.lower() not in {"retired", "inactive"}),
+            source=f"Sleeper player metadata for {season} week {week}; expert ROS ranks supply long-term value",
+        )
+    return WeeklyData(players, warnings, sources, season, week)
+
+
 def load_weekly_players(cache_dir: Path, season: int, week: int, scoring: dict[str, float], refresh: bool = False, confirm_tiers_week: bool = False) -> WeeklyData:
     """Load regular-season advice inputs; missing projections remain ``None``.
 

@@ -5,7 +5,7 @@ shortlists, not forecasts of a manager's willingness to trade or claim success.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 import math
 from typing import Any
@@ -471,3 +471,155 @@ def suggest_trades(
                         "search_scope": "All eligible one-for-one exchanges plus 16 two-player packages per team; positive modeled value for both teams and at least 90% season-strength balance required. Players with missing season values are protected.",
                     })
     return sorted(results, key=lambda r: (r["total_gain"], min(r["total_gain"], r["partner_total_gain"])), reverse=True)[:limit]
+
+
+def analyze_trade_trend(player: WeeklyPlayer, games: list[dict[str, Any]]) -> dict[str, Any]:
+    """Separate recent scoring from a conservative, explicitly heuristic outlook.
+
+    Input is at most four completed-week appearances, scored for this league.
+    Perceived value is a recency-bias scenario, not observed market demand.
+    """
+    unique = {g["week"]: g for g in games if isinstance(g.get("week"), int)
+              and _finite(g.get("points")) is not None}
+    rows = [unique[w] for w in sorted(unique)][-4:]
+    baseline = _finite(player.roster_value) or 0.0
+    current = _finite(player.points)
+    outlook = .75 * baseline + .25 * current if current is not None and not player.bye else baseline
+    result = {"signal": "insufficient_data", "games": len(rows), "weeks": [r["week"] for r in rows],
+              "recent_points": None, "outlook_value": round(max(0, outlook), 4),
+              "perceived_value": round(max(0, outlook), 4), "workload_change": None,
+              "snap_share_change": None, "confidence": "very_low", "provisional": len(rows) < 3,
+              "reason": "At least one completed appearance with workload data is needed."}
+    if not rows or baseline <= 0 or outlook <= 0 or player.position not in {"QB", "RB", "WR", "TE"}:
+        return result
+    recent = sum(r["points"] for r in rows) / len(rows)
+    result["recent_points"] = round(recent, 4)
+    if not _available(player):
+        return {**result, "signal": "unavailable", "reason": "Current injury, bye, or eligibility prevents a supported trade recommendation."}
+    if any(r.get("team") != player.team for r in rows):
+        return {**result, "signal": "role_change", "reason": "The player's team changed or could not be verified; the old workload is not comparable."}
+    if any(_finite(r.get("opportunities")) is None for r in rows):
+        return result
+    comparison_size = min(2, len(rows) - 1) if len(rows) > 1 else 1
+    earlier, latest = rows[:-comparison_size], rows[-comparison_size:]
+    after = sum(r["opportunities"] for r in latest) / len(latest)
+    before = sum(r["opportunities"] for r in earlier) / len(earlier) if earlier else after
+    if before <= 0 or after <= 0:
+        return {**result, "reason": "Too little stable offensive workload to distinguish a streak from a role change."}
+    change = after / before - 1
+    snap_change = None
+    if earlier and all(_finite(r.get("snap_share")) is not None for r in rows):
+        snap_change = (sum(r["snap_share"] for r in latest) / len(latest)
+                       - sum(r["snap_share"] for r in earlier) / len(earlier))
+    falling = change < -.20 or (snap_change is not None and snap_change < -.10)
+    rising = change > .20 or (snap_change is not None and snap_change > .10)
+    # Workload only modestly updates the projection anchor; points alone do not.
+    outlook *= 1 + max(-.15, min(.15, change * .25))
+    confirmations = min(2, len(rows))
+    hot = recent - outlook >= max(3, .25 * outlook) and sum(r["points"] > outlook * 1.15 for r in rows[-3:]) >= confirmations
+    cold = outlook - recent >= max(3, .25 * outlook) and sum(r["points"] < outlook * .85 for r in rows[-3:]) >= confirmations
+    signal = "neutral"
+    reason = "Recent scoring is not a consistent material departure from the outlook."
+    if falling:
+        signal, reason = "role_decline", "Touches/targets or snap share have fallen; a slump may reflect a real loss of role."
+    elif hot and rising:
+        signal, reason = "possible_breakout", "Higher scoring comes with a larger role; selling merely because the player is hot could sacrifice upside."
+    elif hot:
+        signal, reason = "sell_high", "Recent scoring is above the outlook without a matching increase in workload."
+    elif cold:
+        signal, reason = "buy_low", "Recent scoring is below the outlook while offensive workload remains stable or improves."
+    if len(rows) == 1 and signal in {"sell_high", "buy_low"}:
+        reason = "Provisional one-game signal: scoring differs materially from the projection outlook. Workload direction cannot be established from one appearance."
+    perceived = outlook
+    if signal in {"sell_high", "buy_low"}:
+        perceived += max(-.35 * outlook, min(.35 * outlook, .5 * (recent - outlook))) * len(rows) / 4
+    return {**result, "signal": signal, "recent_points": round(recent, 4),
+            "outlook_value": round(outlook, 4), "perceived_value": round(perceived, 4),
+            "workload_change": round(change, 4) if earlier else None,
+            "snap_share_change": round(snap_change, 4) if snap_change is not None else None,
+            "confidence": ("very_low" if len(rows) == 1 else "moderate" if len(rows) == 4 and snap_change is not None and player.status.lower() in {"", "active"} else "low"),
+            "reason": reason}
+
+
+def suggest_opportunity_trades(
+    players: dict[str, WeeklyPlayer], rosters: list[dict[str, Any]], roster_id: int,
+    slots: tuple[str, ...], trends: dict[str, dict[str, Any]], limit: int = 10,
+    capacity: int | None = None,
+) -> list[dict[str, Any]]:
+    """Search sell-high/buy-low exchanges under a labeled recency-bias scenario."""
+    own = _find_roster(rosters, roster_id)
+    own_ids = _active_ids(own)
+    if limit < 1 or (capacity is not None and len(own_ids) > capacity):
+        return []
+    slots = tuple(normalize_position(s) for s in slots if s.upper() not in _NONSTARTER)
+    def eligible(ids):
+        return [players[i] for i in sorted(ids) if i in players and _movable(players[i])
+                and _available(players[i]) and players[i].roster_value > 0
+                and _finite(players[i].points) is not None
+                and trends.get(i, {}).get("signal") in {"sell_high", "buy_low", "neutral", "possible_breakout"}
+                and any(_eligible(players[i], s) for s in slots)]
+    def modeled(field):
+        return {pid: replace(p, points=trends.get(pid, {}).get(field, p.roster_value or None),
+                             locked=False, bye=False) for pid, p in players.items()}
+    outlook_players, perceived_players = modeled("outlook_value"), modeled("perceived_value")
+    own_future = _evaluator(outlook_players, slots, "projection", own)
+    own_week = _evaluator(players, slots, "projection", own)
+    own_before, own_week_before = own_future(own_ids), own_week(own_ids)
+    pool = eligible(own_ids)
+    own_packages = [(p,) for p in pool] + _packages(pool, _ids(own, "starters"))
+    results = []
+    for other in rosters:
+        if str(other["roster_id"]) == str(roster_id):
+            continue
+        other_ids = _active_ids(other)
+        if (capacity is not None and len(other_ids) > capacity) or own_ids & other_ids:
+            continue
+        their_pool = eligible(other_ids)
+        their_packages = [(p,) for p in their_pool] + _packages(their_pool, _ids(other, "starters"))
+        their_future = _evaluator(outlook_players, slots, "projection", other)
+        their_perceived = _evaluator(perceived_players, slots, "projection", other)
+        their_week = _evaluator(players, slots, "projection", other)
+        future_before, perceived_before, week_before = their_future(other_ids), their_perceived(other_ids), their_week(other_ids)
+        for give in own_packages:
+            if not any(trends[p.player_id]["signal"] == "sell_high" for p in give):
+                continue
+            for receive in their_packages:
+                if len(give) != len(receive) or not any(trends[p.player_id]["signal"] == "buy_low" for p in receive):
+                    continue
+                given_future = sum(trends[p.player_id]["outlook_value"] for p in give)
+                received_future = sum(trends[p.player_id]["outlook_value"] for p in receive)
+                given_market = sum(trends[p.player_id]["perceived_value"] for p in give)
+                received_market = sum(trends[p.player_id]["perceived_value"] for p in receive)
+                if received_future <= given_future + .5 or min(given_market, received_market) <= 0:
+                    continue
+                balance = min(given_market, received_market) / max(given_market, received_market)
+                if balance < .80:
+                    continue
+                given_ids, received_ids = {p.player_id for p in give}, {p.player_id for p in receive}
+                after_own_ids, after_other_ids = (own_ids - given_ids) | received_ids, (other_ids - received_ids) | given_ids
+                own_after, future_after = own_future(after_own_ids), their_future(after_other_ids)
+                perceived_after = their_perceived(after_other_ids)
+                if own_after.total <= own_before.total + .5 or perceived_after.total <= perceived_before.total + .1:
+                    continue
+                if own_after.empty > own_before.empty or future_after.empty > future_before.empty or own_after.missing > own_before.missing or future_after.missing > future_before.missing:
+                    continue
+                own_gains = _gains(own_week_before, own_week(after_own_ids))
+                other_gains = _gains(week_before, their_week(after_other_ids), "partner_")
+                def row(p):
+                    return {**_row(p), "trend": trends[p.player_id]}
+                results.append({
+                    "kind": "buy_low_sell_high", "partner_roster_id": other["roster_id"],
+                    "give": [row(p) for p in give], "receive": [row(p) for p in receive],
+                    **own_gains, **other_gains,
+                    "outlook_gain": round(own_after.total - own_before.total, 4),
+                    "partner_outlook_gain": round(future_after.total - future_before.total, 4),
+                    "partner_perceived_gain": round(perceived_after.total - perceived_before.total, 4),
+                    "value_ratio": round(received_market / given_market, 4),
+                    "reason": "Sell recent overperformance to acquire stronger projected potential after a slump. The other team improves only in the modeled recent-form perception scenario, not necessarily in future value.",
+                    "pitch": f"{', '.join(p.name for p in give)} averaged {sum(trends[p.player_id]['recent_points'] for p in give):.1f} combined points over their recent completed appearances; {', '.join(p.name for p in receive)} averaged {sum(trends[p.player_id]['recent_points'] for p in receive):.1f}. This offer gives you the recent production while I take the rebound risk.",
+                    "warnings": ["Speculative opportunity: perceived value models recency bias, not actual manager preferences or acceptance probability.",
+                                 "Outlook is a season/weekly projection and workload proxy, not a calibrated rest-of-season ceiling. Slumps can persist; recent production can continue.",
+                                 "Weekly points may decrease. Check injuries, future role, and trade processing time."],
+                    "search_scope": "Eligible one-for-one and 16 two-player packages per team; at least 80% perceived-value balance, a sell-high/buy-low pairing, and better own outlook. Unlike balanced trades, the partner may lose modeled future value.",
+                })
+    return sorted(results, key=lambda r: r["outlook_gain"], reverse=True)[:limit]

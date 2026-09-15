@@ -124,6 +124,24 @@ def test_failing_sources_return_partial_data_and_warnings(tmp_path, feeds):
     assert any(source["status"] == "unavailable" for source in result.sources)
 
 
+def test_expert_player_loader_uses_metadata_and_locks_without_projection_or_tier_feeds(tmp_path, feeds, monkeypatch):
+    seen = []
+    fixture_fetch = weekly._fetch
+
+    def audited_fetch(cache_dir, key, url, ttl, refresh, **kwargs):
+        seen.append(key.split("-")[0])
+        return fixture_fetch(cache_dir, key, url, ttl, refresh, **kwargs)
+
+    monkeypatch.setattr(weekly, "_fetch", audited_fetch)
+
+    result = weekly.load_expert_players(tmp_path, 2026, 1, {"rec": 1})
+
+    assert set(seen) == {"players", "schedule", "kickoffs"}
+    assert set(result.players) == set(feeds["players"])
+    assert all(player.points is None and player.roster_value == 0 for player in result.players.values())
+    assert any("does not load projection" in warning for warning in result.warnings)
+
+
 def test_tier_scope_ignores_donations_and_reads_explicit_labels():
     assert weekly._scope("<p>2025-2026 donations</p><h3>QB</h3>") == (None, None)
     assert weekly._scope("<h1>2026 Week 1 Rankings</h1>") == (2026, 1)

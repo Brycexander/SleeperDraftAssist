@@ -10,8 +10,12 @@ import requests
 from .cache import cache_directory
 from .models import normalize_position
 from .sleeper import SleeperClient
-from .strategy import WeeklyPlayer, optimize_lineup, suggest_trades, suggest_waivers
-from .weekly import load_weekly_players
+from .strategy import WeeklyPlayer, optimize_lineup, suggest_trades, suggest_waivers, suggest_opportunity_trades
+from .trade_history import load_trade_history
+from .weekly import load_expert_players, load_weekly_players
+from .expert_sources import load_expert_board
+from .expert_moves import suggest_expert_trades, suggest_expert_waivers
+from .tier_charts import load_ppr_tier_charts
 
 
 class TeamService:
@@ -20,10 +24,12 @@ class TeamService:
         client: SleeperClient | None = None,
         loader: Callable[..., Any] = load_weekly_players,
         cache_dir: Path | None = None,
+        expert_loader: Callable[..., Any] = load_expert_players,
     ) -> None:
         self.client = client or SleeperClient()
         self.loader = loader
         self.cache_dir = cache_dir
+        self.expert_loader = expert_loader
 
     def _current_league(
         self, league_id: str, user_id: str, season: int
@@ -63,9 +69,16 @@ class TeamService:
         refresh: bool = False,
         confirm_tiers_week: bool = False,
         expected_season: int | None = None,
+        trade_approach: str = "balanced",
+        valuation_source: str = "sleeper",
+        show_ppr_tiers: bool = False,
     ) -> dict[str, Any]:
         if action not in {"lineup", "waivers", "trades"}:
             raise ValueError("Choose lineup, waivers, or trades.")
+        if trade_approach not in {"balanced", "opportunities"} or (trade_approach != "balanced" and action != "trades"):
+            raise ValueError("Buy-low/sell-high mode is available for trades only; choose balanced or opportunities.")
+        if valuation_source not in {"sleeper", "experts"}:
+            raise ValueError("valuation_source must be sleeper or experts")
         if mode not in {"projection", "tiers"}:
             raise ValueError("Choose projection or tiers mode.")
         if not 1 <= limit <= 25:
@@ -132,16 +145,94 @@ class TeamService:
         active = [players[str(p)] for p in roster.get("players") or [] if str(p) in players and str(p) not in inactive_ids]
         lineup = optimize_lineup(active, slots, mode=mode, current_starters=roster.get("starters") or [])
         warnings.extend(lineup.get("warnings", []))
+        sources = list(data.sources)
+        ppr_tiers: list[dict[str, Any]] = []
+        ppr_tier_sources: list[dict[str, Any]] = []
+        if show_ppr_tiers and action == "lineup":
+            charts, chart_warnings, chart_sources = load_ppr_tier_charts(
+                self.cache_dir or cache_directory(),
+                season,
+                week,
+                players,
+                {player.player_id for player in active},
+                refresh=refresh,
+            )
+            ppr_tiers = charts
+            ppr_tier_sources = chart_sources
+            warnings.extend(chart_warnings)
+            sources.extend(chart_sources)
         settings = league.get("settings") or {}
         if settings.get("best_ball"):
             warnings.append("This is a best-ball league: Sleeper selects the scoring lineup automatically.")
         if action != "lineup" and (settings.get("type") == 2 or settings.get("max_keepers")):
             warnings.append("Keeper and dynasty rights, draft picks, contracts, and player age are not valued in these roster moves.")
-        if action != "lineup" and any(p.roster_value <= 0 for p in active):
+        if action != "lineup" and valuation_source == "sleeper" and any(p.roster_value <= 0 for p in active):
             warnings.append("Players without season-strength estimates are protected from drops and trades; missing estimates can reduce the suggestions shown.")
         suggestions: list[dict[str, Any]] = []
+        trend_players: list[dict[str, Any]] = []
+        discussion_candidates: list[dict[str, Any]] = []
+        near_misses: list[dict[str, Any]] = []
+        diagnostics: dict[str, Any] = {}
+        expert_status = None
+        expert_panel: list[str] = []
+        expert_selection: list[dict[str, Any]] = []
+        expert_exclusions: list[dict[str, Any]] = []
+        expert_coverage = 0
+        replacement = {}
         capacity = len([p for p in positions if p not in {"IR", "TAXI"}])
-        if action == "waivers":
+        if valuation_source == "experts" and action in {"waivers", "trades"}:
+            from .expert_moves import MoveSearch
+            from .roster_value import replacement_ranks
+            scoring_name = "PPR" if scoring.get("rec", 0) == 1 else "HALF" if scoring.get("rec", 0) == 0.5 else "STD"
+            expert_status, board, expert_sources, expert_warnings = load_expert_board(
+                self.cache_dir or cache_directory(), season=season, week=week, scoring=scoring_name,
+                now=datetime.now(timezone.utc), refresh=refresh,
+            )
+            sources.extend(expert_sources)
+            expert_exclusions = [
+                item for source in expert_sources for item in source.get("excluded_experts", [])
+            ]
+            warnings.extend(expert_warnings)
+            if board is not None and expert_status == "ready":
+                expert_data = self.expert_loader(
+                    self.cache_dir or cache_directory(), season, week, scoring, refresh=refresh
+                )
+                expert_players = dict(expert_data.players)
+                warnings.extend(expert_data.warnings)
+                sources.extend(expert_data.sources)
+                for team in rosters:
+                    for raw_id in dict.fromkeys(
+                        str(p) for key in ("players", "reserve", "taxi", "starters")
+                        for p in team.get(key) or [] if p and str(p) != "0"
+                    ):
+                        if raw_id not in expert_players:
+                            value = board.values.get(raw_id)
+                            expert_players[raw_id] = WeeklyPlayer(
+                                player_id=raw_id, name=f"Unknown player ({raw_id})",
+                                position=value.position if value else "", team="", points=None,
+                                rosterable=value is not None, locked=True,
+                                source="Missing from Sleeper metadata; conservatively locked",
+                            )
+                            warnings.append(f"Player {raw_id} is missing from Sleeper metadata and is conservatively locked in expert mode.")
+                replacement = replacement_ranks(expert_players, rosters, board)
+                if action == "waivers":
+                    result = suggest_expert_waivers(expert_players, rosters, int(roster["roster_id"]), slots, board, capacity=capacity, limit=limit)
+                else:
+                    result = suggest_expert_trades(expert_players, rosters, int(roster["roster_id"]), slots, board, capacity=capacity, approach=trade_approach, limit=limit)
+                suggestions = result.suggestions
+                discussion_candidates = result.discussion_candidates
+                near_misses = result.near_misses
+                diagnostics = result.diagnostics
+                expert_panel = list(board.panel_ids)
+                expert_selection = [
+                    {"expert_id": expert_id, "score": score}
+                    for expert_id, score in board.panel_scores
+                ]
+                expert_coverage = len(board.values)
+            else:
+                warnings.append("Expert transaction advice is withheld until at least five experts qualify through the rolling multi-year ROS accuracy screen.")
+            warnings.append("Expert transaction advice uses rank credits for rest-of-season roster comparison; it does not use Sleeper projections or Fantasy Football Tiers.")
+        elif action == "waivers":
             if settings.get("disable_adds"):
                 warnings.append("Player additions are disabled in this league.")
             else:
@@ -151,17 +242,43 @@ class TeamService:
             deadline = int(settings.get("trade_deadline") or 0)
             if settings.get("disable_trades") or (deadline and current_week > deadline):
                 warnings.append("Trading is disabled or the league's trade deadline has passed.")
+            elif trade_approach == "opportunities":
+                rostered = {str(p) for r in rosters for p in r.get("players") or []}
+                history = load_trade_history(self.cache_dir or cache_directory(), season, week, scoring,
+                                             {pid: p for pid, p in players.items() if pid in rostered}, refresh=refresh)
+                warnings.extend(history.warnings)
+                sources.extend(history.sources)
+                suggestions = suggest_opportunity_trades(players, rosters, int(roster["roster_id"]), slots,
+                                                          history.trends, limit=limit, capacity=capacity)
+                for team in rosters:
+                    for pid in team.get("players") or []:
+                        pid = str(pid)
+                        if pid in history.trends and players[pid].position in {"QB", "RB", "WR", "TE"}:
+                            trend_players.append({"player_id": pid, "name": players[pid].name,
+                                                  "position": players[pid].position, "roster_id": team["roster_id"],
+                                                  **history.trends[pid]})
             else:
                 suggestions = suggest_trades(players, rosters, int(roster["roster_id"]), slots, limit=limit, mode=mode, capacity=capacity)
-            warnings.append("Trade gains are estimates for this week's roster. Review longer-term value and processing time; mutual improvement does not predict acceptance.")
+            warnings.append("Trade gains are estimates. Review longer-term value and processing time; modeled benefit does not predict acceptance.")
         return {
             "action": action, "league_id": resolved_id, "league_name": league["name"].strip(),
             "season": season, "week": week, "mode": mode, "roster_id": roster["roster_id"],
             "scoring": {"ppr": scoring.get("rec", 0), "passing_td": scoring.get("pass_td", 0)},
             "slots": slots, "lineup": lineup, "suggestions": suggestions,
-            "warnings": list(dict.fromkeys(warnings)), "sources": data.sources,
+            "ppr_tiers": ppr_tiers, "ppr_tier_sources": ppr_tier_sources,
+            "warnings": list(dict.fromkeys(warnings)), "sources": sources,
+            "trade_approach": trade_approach, "trend_players": trend_players,
+            "valuation_source": valuation_source, "expert_status": expert_status,
+            "expert_panel": expert_panel, "expert_selection": expert_selection,
+            "expert_exclusions": expert_exclusions, "expert_coverage": expert_coverage,
+            "discussion_candidates": discussion_candidates, "near_misses": near_misses,
+            "diagnostics": diagnostics, "replacement_ranks": replacement,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "method": (
+                "Expert rest-of-season roster comparison using selected expert rank credits."
+                if valuation_source == "experts" and action in {"waivers", "trades"} else
+                "Buy-low/sell-high: projected outlook and workload are compared with recent-form perception. Perception and confidence are heuristic, not observed market prices or acceptance odds."
+                if action == "trades" and trade_approach == "opportunities" else
                 "Maximum projected points across every legal starter assignment."
                 if mode == "projection" else
                 "Tiers guide choices within positions; projections put FLEX choices on a common scale."

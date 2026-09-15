@@ -245,6 +245,50 @@ data is not silently reused after an outage. Sleeper schedules and ESPN kickoff
 times are cross-checked; missing kickoff times conservatively lock players with
 games today or earlier. Unsupported scoring categories are disclosed.
 
+### Buy-low / sell-high trades
+
+In **Manage team → Trades**, select **Buy low / sell high** under Trade strategy.
+The existing Balanced trades option remains available. CLI equivalent:
+
+```bash
+uv run sleeper-draft --league shield-ai trades --trade-approach opportunities
+```
+
+This mode uses Sleeper's actual, league-scored offensive statistics from the four
+weeks before the current week. It supports one completed appearance, verifies
+game completion, deduplicates player/week rows, and excludes the current week's
+partial results. Byes, missed games, and unavailable statistics are not zeroes.
+One-game ideas are provisional with very low confidence; they are possible from
+week 2 using week 1 results. Two-game ideas are also provisional. A single
+appearance cannot establish workload direction, so it receives no role-trend
+adjustment and a quarter of the full four-game perceived-value adjustment.
+
+Recent scoring is compared with a conservative outlook proxy: 75% season
+strength plus 25% current weekly projection, adjusted at most 15% for workload
+changes. WR/TE workload uses targets, RB workload uses carries plus targets, and
+QB workload uses attempts plus carries. The latest two appearances are compared
+with earlier appearances; snap-share changes are checked when available.
+Material, repeated overperformance with stable workload can be a sell-high;
+underperformance with stable/improving workload can be a buy-low. Growing roles
+are flagged as possible breakouts, while lost roles, team changes, and current
+unavailability block bargain assumptions. Missing workload prevents a signal.
+
+Perceived value is explicitly a recency-bias scenario: half the recent scoring
+gap, capped at 35% of outlook and weighted by appearances divided by four. It is not a
+measured market price or acceptance probability. Candidate swaps require a
+sell-high/buy-low pairing, greater incoming outlook, positive own roster outlook
+gain, and positive partner gain in the perception scenario. Packages must have
+at least 80% perceived-value balance. Unlike Balanced trades, a partner can lose
+projected future value; that loss is shown explicitly. Current game locks,
+ownership, roster capacity, and starter coverage still apply.
+
+Reports show both teams' outlook changes, this week's point changes, workload
+evidence, a qualitative confidence label, and a factual discussion opener.
+The outlook and confidence labels are heuristics, not calibrated rest-of-season
+ceilings or probabilities. Matchup strength, route participation, red-zone role,
+and teammate injury opportunities are not explicitly modeled. A slump can
+persist and a scoring surge can continue; review these factors before offering.
+
 ## Draft strategy review
 
 The review corrected rigid QB limits, incomplete flexible-slot handling,
@@ -293,3 +337,78 @@ online source is unavailable on draft night.
 ```bash
 uv run pytest -q
 ```
+
+### Expert ROS transaction mode
+
+Trades and waivers can use an imported candidate pool of expert
+rest-of-season ranks. Choose **Rolling multi-year expert ROS ranks** in Manage team,
+or pass `--valuation-source experts` to the `waivers` or `trades` CLI command.
+The app selects five to eight experts using their comparable overall ROS
+accuracy over the last two or three completed seasons. Accuracy percentiles use
+a 50/30/20 recency weighting, then shrink toward the field average when fewer
+seasons or graded weeks are available. From week 7 onward, current-season
+accuracy can contribute up to 20%. No more than two selected experts may come
+from one publisher. The final player consensus is the median current ROS rank;
+expert accuracy does not weight individual player ranks.
+
+Expert transactions build their player universe from Sleeper player metadata
+and verified game locks. They do not use weekly or season projection rows to
+include, exclude, or value transaction candidates. The lineup displayed beside
+the transaction report may still use weekly projections because it is a
+separate weekly decision.
+
+Each candidate needs at least two of the last three completed ROS accuracy
+seasons, at least six graded weeks per included season, the accuracy field size,
+matching scoring, a current overall QB/RB/WR/TE list with at least 100 players,
+and a publication date no older than seven days. The UI displays each player's
+best-to-worst expert rank range and labels agreement as high, medium, or low.
+No paid subscription or automatic fallback to Sleeper projections is assumed.
+
+The server accepts an authenticated snapshot at `POST /api/team/expert-snapshot`.
+The request body is the JSON document itself; it must be under 2 MiB. Use
+`schema_version: 2`, an `accuracy_history` array on each submission, and include
+`field_size` and `graded_weeks` on each accuracy record. Version 1 files remain
+readable so the app can explain why their single-season evidence no longer
+qualifies. The
+operator can also place a validated file in `EXPERT_SNAPSHOT_DIR` using the
+filename `expert-ros-{season}-{week}-{STD|HALF|PPR}.json`. The format and
+validation rules are documented in
+`docs/superpowers/specs/2026-09-13-expert-roster-advice-design.md`.
+
+For local/operator imports, use the current season reported by Sleeper:
+
+```bash
+uv run sleeper-draft import-expert-rankings rankings.json --week 2 --scoring PPR
+```
+
+The import response lists selected and excluded experts with their selection
+scores or exclusion reasons. Expert transaction results use rank credits, which are monotonic comparison
+units rather than fantasy points, trade prices, or acceptance probabilities.
+Fantasy Football Tiers remains a lineup-only preference. If a panel is missing,
+stale, incomplete, or incompatible with the league format, expert advice is
+withheld and the report explains why; the legacy Sleeper mode must be selected
+explicitly.
+
+Each candidate submission has this shape (repeat the accuracy records and player
+rows with real, cited data):
+
+```json
+{
+  "expert_id": "stable-expert-id",
+  "name": "Expert Name",
+  "publisher": "Publisher",
+  "published_at": "2026-09-14T12:00:00Z",
+  "source_url": "https://example.com/current-ros-ranks",
+  "accuracy_history": [
+    {"season": 2025, "horizon": "ros", "scope": "overall", "scoring": "PPR", "place": 4, "field_size": 100, "graded_weeks": 14, "url": "https://example.com/2025-accuracy"},
+    {"season": 2024, "horizon": "ros", "scope": "overall", "scoring": "PPR", "place": 9, "field_size": 95, "graded_weeks": 14, "url": "https://example.com/2024-accuracy"}
+  ],
+  "rows": [
+    {"player_id": "sleeper-player-id", "position": "WR", "overall_rank": 1}
+  ]
+}
+```
+
+The full document wraps 1–50 submissions with `season`, `week`, `scoring`,
+`fetched_at`, `horizon: "ros"`, `roster_format: "redraft_1qb"`, and
+`rank_scope: "overall_qb_rb_wr_te"`. At least five must pass selection.

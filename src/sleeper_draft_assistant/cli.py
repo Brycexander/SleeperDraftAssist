@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 import json
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -14,6 +15,7 @@ from .rankings import load_consensus_board
 from .simulator import DraftAnalysisReport, MonteCarloDraft, SimulationReport
 from .sleeper import SleeperClient
 from .valuation import ValuationDiagnostics, build_player_values
+from .expert_sources import import_expert_snapshot
 
 
 DEFAULT_USERNAME = "brycexander"
@@ -85,6 +87,16 @@ def build_parser() -> argparse.ArgumentParser:
         team.add_argument("--refresh", action="store_true", help="Refresh weekly source data")
         team.add_argument("--confirm-tiers-week", action="store_true", help="Confirm you checked the tiers site matches --season and --week")
         team.add_argument("--json", action="store_true", help="Print the full structured report")
+        if command in {"waivers", "trades"}:
+            team.add_argument("--valuation-source", choices=("sleeper", "experts"), default="sleeper",
+                              help="Use legacy Sleeper projections or imported expert ROS ranks")
+        if command == "trades":
+            team.add_argument("--trade-approach", choices=("balanced", "opportunities"), default="balanced",
+                              help="Balanced swaps or speculative buy-low/sell-high ideas")
+    import_cmd = subparsers.add_parser("import-expert-rankings", help="Import a validated expert ROS JSON snapshot")
+    import_cmd.add_argument("path", type=Path)
+    import_cmd.add_argument("--week", type=int, choices=range(1, 19), required=True)
+    import_cmd.add_argument("--scoring", choices=("STD", "HALF", "PPR"), required=True)
     return parser
 
 
@@ -501,6 +513,8 @@ def _manage_team(client: SleeperClient, args: argparse.Namespace) -> None:
         _league_id(args), args.username, action=args.command, week=args.week,
         mode=args.mode, limit=args.limit, refresh=args.refresh,
         confirm_tiers_week=args.confirm_tiers_week, expected_season=args.season,
+        trade_approach=getattr(args, "trade_approach", "balanced"),
+        valuation_source=getattr(args, "valuation_source", "sleeper"),
     )
     if args.json:
         print(json.dumps(report, indent=2, allow_nan=False))
@@ -508,19 +522,26 @@ def _manage_team(client: SleeperClient, args: argparse.Namespace) -> None:
     print(f"{report['league_name']} | {report['season']} week {report['week']} | {report['scoring']['ppr']:g} PPR")
     print(report["method"])
     lineup = report["lineup"]
-    print(f"Projected starters: {lineup['projected_points']:.2f} points")
-    for row in lineup["starters"]:
-        points = "no projection" if row.get("points") is None else f"{row['points']:.2f} pts"
-        print(f"  {row['slot']:12s} {row.get('name') or 'Empty slot':28s} {points}")
+    if lineup:
+        print(f"Projected starters: {lineup['projected_points']:.2f} points")
+        for row in lineup["starters"]:
+            points = "no projection" if row.get("points") is None else f"{row['points']:.2f} pts"
+            print(f"  {row['slot']:12s} {row.get('name') or 'Empty slot':28s} {points}")
     for item in report["suggestions"]:
         if args.command == "waivers":
             drop = item.get("drop")
-            print(f"Add {item['add']['name']} / drop {drop['name'] if drop else 'nobody (open slot)'}: {item['weekly_gain']:+.2f} weekly points")
+            gain = item.get("weekly_gain", item.get("own_gain", {}).get("starters", 0.0))
+            print(f"Add {item['add']['name']} / drop {drop['name'] if drop else 'nobody (open slot)'}: {gain:+.2f} rank-credit starters")
         else:
             give = ", ".join(p["name"] for p in item["give"])
             receive = ", ".join(p["name"] for p in item["receive"])
-            print(f"Team {item['partner_roster_id']}: send {give}; receive {receive}. You {item['weekly_gain']:+.2f}, partner {item['partner_weekly_gain']:+.2f} weekly points")
+            own_gain = item.get("own_gain", {}).get("starters", item.get("weekly_gain", 0.0))
+            partner_gain = item.get("partner_gain", {}).get("starters", item.get("partner_weekly_gain", 0.0))
+            print(f"Team {item['partner_roster_id']}: send {give}; receive {receive}. You {own_gain:+.2f}, partner {partner_gain:+.2f} starter rank credits")
         print(f"  {item['reason']}")
+        if item.get("kind") == "buy_low_sell_high":
+            print(f"  Outlook gain: {item['outlook_gain']:+.2f}; partner outlook {item['partner_outlook_gain']:+.2f}; partner perceived gain {item['partner_perceived_gain']:+.2f}")
+            print(f"  Possible discussion opener: {item['pitch']}")
         for warning in item.get("warnings", []):
             print(f"  Note: {warning}")
     if args.command != "lineup" and not report["suggestions"]:
@@ -535,6 +556,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     client = SleeperClient()
     try:
+        if args.command == "import-expert-rankings":
+            state = client.nfl_state()
+            result = import_expert_snapshot(args.path.read_bytes(), cache_directory(), season=int(state["season"]),
+                                            week=args.week, scoring=args.scoring, now=datetime.now().astimezone())
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("status") == "ready" else 1
         if args.command in {"lineup", "waivers", "trades"}:
             _manage_team(client, args)
             return 0
